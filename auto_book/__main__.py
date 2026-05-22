@@ -6,7 +6,7 @@ import uuid
 from rich.console import Console
 
 from auto_book.cli import get_user_brief, parse_args
-from auto_book.config import load_settings
+from auto_book.config import load_settings, set_settings
 from auto_book.models.run_state import RunPhase, RunState
 from auto_book.orchestrator.checkpointer import (
     load_checkpoint,
@@ -23,6 +23,7 @@ def main() -> None:
 
     args = parse_args()
     cfg = load_settings(args.config)
+    set_settings(cfg)
     output_dir = args.output or cfg.output.directory
     log_file = str(Path(output_dir) / "run.log")
 

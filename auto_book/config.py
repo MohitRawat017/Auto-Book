@@ -104,5 +104,12 @@ def require_groq_api_key() -> str:
     return secrets.groq_api_key
 
 
+def set_settings(new_settings: Settings) -> None:
+    """Replace module-level settings after loading a custom config file."""
+
+    for field_name in Settings.model_fields:
+        setattr(settings, field_name, getattr(new_settings, field_name))
+
+
 secrets = Secrets()
 settings = load_settings()

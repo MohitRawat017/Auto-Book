@@ -1,0 +1,41 @@
+# Cheap Phase 2 smoke-test configuration.
+
+llm:
+  provider: "groq"
+  writer_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
+  reviewer_model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  planner_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
+  memory_model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  temperature_creative: 0.7
+  temperature_analytical: 0.2
+
+book:
+  default_chapter_count: 3
+  target_words_per_chapter: 500
+  min_words_per_chapter: 250
+  max_words_per_chapter: 900
+  target_total_pages: 6
+
+retry:
+  max_revisions: 2
+  max_regenerations: 1
+  max_validation_retries: 2
+  retry_delay_seconds: 2
+
+context_budget:
+  system_prompt: 500
+  book_bible: 1200
+  dynamic_memory: 1200
+  research_notes: 0
+  chapter_plan: 500
+  generation_headroom: 2000
+  total_max: 6000
+
+output:
+  directory: "./output/phase2_smoke"
+  save_intermediate: true
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_file: "./output/phase2_smoke/run.log"

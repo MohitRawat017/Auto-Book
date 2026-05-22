@@ -1,11 +1,11 @@
-"""LangGraph state machine for the Phase 1 skeleton."""
+"""LangGraph state machine for the Phase 2 core writing loop."""
 
 from collections.abc import Callable
 from typing import Any
 
 from langgraph.graph import END, StateGraph
 
-from auto_book.agents.assembler import assemble_stub
+from auto_book.agents.assembler import assemble_markdown
 from auto_book.agents.memory_updater import run_memory_update
 from auto_book.agents.planner import run_planner
 from auto_book.agents.reviewer import run_reviewer
@@ -17,6 +17,12 @@ from auto_book.models.review import ReviewDecisionEnum
 from auto_book.models.run_state import ChapterStatus, RunPhase
 from auto_book.orchestrator.checkpointer import save_graph_checkpoint
 from auto_book.orchestrator.state import GraphState
+from auto_book.utils.artifacts import (
+    save_book_bible,
+    save_chapter_draft,
+    save_dynamic_memory,
+    save_review,
+)
 from auto_book.utils.logger import get_logger
 
 
@@ -75,24 +81,37 @@ def collect_input(state: GraphState) -> dict[str, Any]:
 
 
 def plan_book(state: GraphState) -> dict[str, Any]:
-    """Create a stub Book Bible."""
+    """Create or reuse a live Book Bible."""
 
     logger = get_logger()
     if state.get("error"):
         return {"phase": RunPhase.FAILED}
 
-    bible = run_planner(state["user_brief"], state.get("genre", "non-fiction how-to"))
-    chapter_statuses = [
-        ChapterStatus(chapter_number=chapter.chapter_number)
-        for chapter in bible.chapter_outline
-    ]
-    logger.info("Planning complete: %s", bible.working_title)
-    return {
-        "book_bible": bible,
-        "chapter_statuses": chapter_statuses,
-        "current_chapter": 0,
-        "phase": RunPhase.PLANNING,
-    }
+    if state.get("book_bible") is not None:
+        logger.info("Existing Book Bible found; skipping planning")
+        return {"phase": RunPhase.PLANNING}
+
+    try:
+        bible = run_planner(
+            state["user_brief"],
+            state.get("genre", "non-fiction how-to"),
+        )
+        output_dir = state.get("output_directory", settings.output.directory)
+        save_book_bible(bible, output_dir)
+        chapter_statuses = [
+            ChapterStatus(chapter_number=chapter.chapter_number)
+            for chapter in bible.chapter_outline
+        ]
+        logger.info("Planning complete: %s", bible.working_title)
+        return {
+            "book_bible": bible,
+            "chapter_statuses": chapter_statuses,
+            "current_chapter": 0,
+            "phase": RunPhase.PLANNING,
+        }
+    except Exception as exc:
+        logger.error("Planning failed: %s", exc)
+        return {"phase": RunPhase.FAILED, "error": str(exc)}
 
 
 def prepare_chapter(state: GraphState) -> dict[str, Any]:
@@ -142,7 +161,7 @@ def prepare_chapter(state: GraphState) -> dict[str, Any]:
 
 
 def write_chapter(state: GraphState) -> dict[str, Any]:
-    """Create a stub chapter draft."""
+    """Draft or revise a chapter with the live Writer Agent."""
 
     logger = get_logger()
     bible = state.get("book_bible")
@@ -163,12 +182,17 @@ def write_chapter(state: GraphState) -> dict[str, Any]:
     elif review and review.decision == ReviewDecisionEnum.FAIL:
         regeneration_count += 1
 
-    draft = run_writer(
-        chapter_plan=chapter_plan,
-        book_bible=bible,
-        dynamic_memory=state.get("dynamic_memory", DynamicMemory()),
-        revision_feedback=revision_feedback,
-    )
+    try:
+        draft = run_writer(
+            chapter_plan=chapter_plan,
+            book_bible=bible,
+            dynamic_memory=state.get("dynamic_memory", DynamicMemory()),
+            revision_feedback=revision_feedback,
+        )
+    except Exception as exc:
+        logger.error("Writing failed for chapter %s: %s", chapter_plan.chapter_number, exc)
+        return {"phase": RunPhase.FAILED, "error": str(exc)}
+
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         draft.chapter_number,
@@ -188,9 +212,12 @@ def write_chapter(state: GraphState) -> dict[str, Any]:
 
 
 def review_chapter(state: GraphState) -> dict[str, Any]:
-    """Review the current stub draft."""
+    """Review the current draft with the live Reviewer Agent."""
 
     logger = get_logger()
+    if state.get("phase") == RunPhase.FAILED:
+        return {"phase": RunPhase.FAILED, "error": state.get("error", "")}
+
     bible = state.get("book_bible")
     draft = state.get("chapter_draft")
     if bible is None or draft is None:
@@ -199,7 +226,12 @@ def review_chapter(state: GraphState) -> dict[str, Any]:
             "error": "Cannot review chapter without Book Bible and ChapterDraft.",
         }
 
-    review = run_reviewer(draft, bible, state.get("dynamic_memory", DynamicMemory()))
+    try:
+        review = run_reviewer(draft, bible, state.get("dynamic_memory", DynamicMemory()))
+    except Exception as exc:
+        logger.error("Review failed for chapter %s: %s", draft.chapter_number, exc)
+        return {"phase": RunPhase.FAILED, "error": str(exc)}
+
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         draft.chapter_number,
@@ -219,14 +251,28 @@ def review_chapter(state: GraphState) -> dict[str, Any]:
 
 
 def update_memory(state: GraphState) -> dict[str, Any]:
-    """Update memory and accept a passing chapter."""
+    """Update memory, accept a passing chapter, and save artifacts."""
 
     logger = get_logger()
     draft = state.get("chapter_draft")
     if draft is None:
         return {"phase": RunPhase.FAILED, "error": "No draft to accept."}
 
-    memory = run_memory_update(draft, state.get("dynamic_memory", DynamicMemory()))
+    try:
+        memory = run_memory_update(draft, state.get("dynamic_memory", DynamicMemory()))
+    except Exception as exc:
+        logger.error("Memory update failed for chapter %s: %s", draft.chapter_number, exc)
+        return {"phase": RunPhase.FAILED, "error": str(exc)}
+
+    output_dir = state.get("output_directory", settings.output.directory)
+    review = state.get("review_decision")
+    save_chapter_draft(draft, output_dir)
+    if review is not None:
+        save_review(review, output_dir)
+    save_dynamic_memory(memory, output_dir)
+    if state.get("book_bible") is not None:
+        save_book_bible(state["book_bible"], output_dir)
+
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         draft.chapter_number,
@@ -253,7 +299,7 @@ def check_next(state: GraphState) -> dict[str, Any]:
 
 
 def assemble_book(state: GraphState) -> dict[str, Any]:
-    """Run the Phase 1 stub assembler."""
+    """Assemble accepted chapters into Markdown."""
 
     logger = get_logger()
     bible = state.get("book_bible")
@@ -265,8 +311,20 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
         for status in state.get("chapter_statuses", [])
         if status.accepted_draft is not None
     ]
-    export_result = assemble_stub(bible, accepted)
-    logger.info("Stub assembly complete")
+    if not accepted:
+        return {"phase": RunPhase.FAILED, "error": "No accepted chapters to assemble."}
+
+    try:
+        export_result = assemble_markdown(
+            bible,
+            accepted,
+            state.get("output_directory", settings.output.directory),
+        )
+    except Exception as exc:
+        logger.error("Markdown assembly failed: %s", exc)
+        return {"phase": RunPhase.FAILED, "error": str(exc)}
+
+    logger.info("Markdown assembly complete")
     return {
         "export_result": export_result,
         "phase": RunPhase.ASSEMBLING,
@@ -274,9 +332,9 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
 
 
 def export_book(state: GraphState) -> dict[str, Any]:
-    """Complete the Phase 1 placeholder export step."""
+    """Mark the Markdown export complete."""
 
-    get_logger().info("Phase 1 export step complete (no files written).")
+    get_logger().info("Phase 2 Markdown export complete.")
     return {"phase": RunPhase.COMPLETED}
 
 
@@ -314,6 +372,32 @@ def route_after_review(state: GraphState) -> str:
     return "handle_failure"
 
 
+def route_after_step(state: GraphState) -> str:
+    """Route to failure if a node marked the run failed."""
+
+    if state.get("phase") == RunPhase.FAILED:
+        return "handle_failure"
+    return "next"
+
+
+def route_after_prepare(state: GraphState) -> str:
+    """Route after preparing a chapter."""
+
+    if state.get("phase") == RunPhase.FAILED:
+        return "handle_failure"
+    if state.get("phase") == RunPhase.ASSEMBLING:
+        return "assemble_book"
+    return "write_chapter"
+
+
+def route_after_assemble(state: GraphState) -> str:
+    """Route after assembly."""
+
+    if state.get("phase") == RunPhase.FAILED:
+        return "handle_failure"
+    return "export_book"
+
+
 def route_after_check(state: GraphState) -> str:
     """Route to the next chapter or assembly."""
 
@@ -324,7 +408,7 @@ def route_after_check(state: GraphState) -> str:
 
 
 def build_graph():
-    """Construct and compile the Phase 1 graph."""
+    """Construct and compile the Phase 2 graph."""
 
     graph = StateGraph(GraphState)
 
@@ -340,14 +424,51 @@ def build_graph():
     graph.add_node("handle_failure", _checkpointing_node(handle_failure))
 
     graph.set_entry_point("collect_input")
-    graph.add_edge("collect_input", "plan_book")
-    graph.add_edge("plan_book", "prepare_chapter")
-    graph.add_edge("prepare_chapter", "write_chapter")
-    graph.add_edge("write_chapter", "review_chapter")
     graph.add_edge("update_memory", "check_next")
-    graph.add_edge("assemble_book", "export_book")
     graph.add_edge("export_book", END)
     graph.add_edge("handle_failure", END)
+
+    graph.add_conditional_edges(
+        "collect_input",
+        route_after_step,
+        {
+            "next": "plan_book",
+            "handle_failure": "handle_failure",
+        },
+    )
+    graph.add_conditional_edges(
+        "plan_book",
+        route_after_step,
+        {
+            "next": "prepare_chapter",
+            "handle_failure": "handle_failure",
+        },
+    )
+    graph.add_conditional_edges(
+        "prepare_chapter",
+        route_after_prepare,
+        {
+            "write_chapter": "write_chapter",
+            "assemble_book": "assemble_book",
+            "handle_failure": "handle_failure",
+        },
+    )
+    graph.add_conditional_edges(
+        "write_chapter",
+        route_after_step,
+        {
+            "next": "review_chapter",
+            "handle_failure": "handle_failure",
+        },
+    )
+    graph.add_conditional_edges(
+        "assemble_book",
+        route_after_assemble,
+        {
+            "export_book": "export_book",
+            "handle_failure": "handle_failure",
+        },
+    )
 
     graph.add_conditional_edges(
         "review_chapter",
