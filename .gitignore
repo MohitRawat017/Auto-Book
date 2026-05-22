@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local configuration and generated outputs
+.env
+output/

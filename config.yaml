@@ -1,0 +1,41 @@
+# Auto_Book Configuration
+
+llm:
+  provider: "groq"
+  writer_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
+  reviewer_model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  planner_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
+  memory_model: "meta-llama/llama-4-scout-17b-16e-instruct"
+  temperature_creative: 0.7
+  temperature_analytical: 0.2
+
+book:
+  default_chapter_count: 10
+  target_words_per_chapter: 1500
+  min_words_per_chapter: 800
+  max_words_per_chapter: 2500
+  target_total_pages: 30
+
+retry:
+  max_revisions: 2
+  max_regenerations: 1
+  max_validation_retries: 3
+  retry_delay_seconds: 2
+
+context_budget:
+  system_prompt: 500
+  book_bible: 1500
+  dynamic_memory: 1500
+  research_notes: 1000
+  chapter_plan: 500
+  generation_headroom: 3000
+  total_max: 8000
+
+output:
+  directory: "./output"
+  save_intermediate: true
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_file: "./output/run.log"
