@@ -1,11 +1,16 @@
-"""Markdown assembler for accepted chapters."""
+"""Assemblers for Markdown and DOCX book exports."""
 
 from pathlib import Path
 import re
 
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt, RGBColor
+
 from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft
 from auto_book.models.export import ExportResult
+from auto_book.models.image import ImageAsset
 from auto_book.utils.logger import get_logger
 
 
@@ -13,14 +18,16 @@ def assemble_markdown(
     book_bible: BookBible,
     chapters: list[ChapterDraft],
     output_dir: str,
+    image_assets: list[ImageAsset] | None = None,
 ) -> ExportResult:
-    """Assemble accepted chapters into output/book.md."""
+    """Assemble accepted chapters into output/book.md with image references."""
 
     logger = get_logger()
     output_path = Path(output_dir) / "book.md"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ordered = sorted(chapters, key=lambda chapter: chapter.chapter_number)
+    images = image_assets or []
     parts: list[str] = []
 
     parts.append(f"# {book_bible.working_title}\n")
@@ -40,6 +47,7 @@ def assemble_markdown(
     for chapter in ordered:
         parts.append(f"\n## Chapter {chapter.chapter_number}: {chapter.title}\n")
         parts.append(_strip_duplicate_title(chapter))
+        parts.extend(_markdown_images_for_chapter(chapter, images, output_path.parent))
         if chapter.key_takeaways:
             parts.append("\n### Key Takeaways\n")
             parts.extend(f"- {takeaway}" for takeaway in chapter.key_takeaways)
@@ -58,8 +66,179 @@ def assemble_markdown(
         markdown_path=str(output_path),
         total_chapters=len(ordered),
         total_word_count=word_count,
+        images_embedded=sum(1 for asset in images if not asset.is_placeholder),
         success=True,
     )
+
+
+def assemble_docx(
+    book_bible: BookBible,
+    chapters: list[ChapterDraft],
+    output_dir: str,
+    image_assets: list[ImageAsset] | None = None,
+) -> str:
+    """Assemble accepted chapters and available images into output/book.docx."""
+
+    logger = get_logger()
+    output_path = Path(output_dir) / "book.docx"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ordered = sorted(chapters, key=lambda chapter: chapter.chapter_number)
+    images = image_assets or []
+    doc = Document()
+
+    _add_title_page(doc, book_bible)
+    doc.add_page_break()
+    doc.add_heading("Table of Contents", level=1)
+    for chapter in ordered:
+        doc.add_paragraph(
+            f"Chapter {chapter.chapter_number}: {chapter.title}",
+            style="List Number",
+        )
+
+    for chapter in ordered:
+        doc.add_page_break()
+        _add_chapter(doc, chapter, images)
+
+    doc.save(str(output_path))
+    logger.info("DOCX assembled at %s", output_path)
+    return str(output_path)
+
+
+def _add_title_page(doc: Document, bible: BookBible) -> None:
+    for _ in range(6):
+        doc.add_paragraph("")
+
+    title = doc.add_heading(bible.working_title, level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    if bible.subtitle:
+        subtitle = doc.add_paragraph(bible.subtitle)
+        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in subtitle.runs:
+            run.font.size = Pt(16)
+            run.font.color.rgb = RGBColor(100, 100, 100)
+
+    doc.add_paragraph("")
+    tagline = doc.add_paragraph(bible.book_promise)
+    tagline.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in tagline.runs:
+        run.font.italic = True
+        run.font.size = Pt(12)
+
+
+def _add_chapter(
+    doc: Document,
+    chapter: ChapterDraft,
+    image_assets: list[ImageAsset],
+) -> None:
+    doc.add_heading(f"Chapter {chapter.chapter_number}: {chapter.title}", level=1)
+    _add_markdown_body(doc, _strip_duplicate_title(chapter))
+    _add_docx_images_for_chapter(doc, chapter, image_assets)
+
+    if chapter.key_takeaways:
+        doc.add_heading("Key Takeaways", level=3)
+        for takeaway in chapter.key_takeaways:
+            doc.add_paragraph(takeaway, style="List Bullet")
+
+
+def _add_markdown_body(doc: Document, markdown: str) -> None:
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            doc.add_heading(line[4:], level=3)
+        elif line.startswith("## "):
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith("# "):
+            doc.add_heading(line[2:], level=1)
+        elif line.startswith("- ") or line.startswith("* "):
+            doc.add_paragraph(line[2:], style="List Bullet")
+        elif re.match(r"^\d+[\.)]\s+", line):
+            doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", line), style="List Number")
+        else:
+            paragraph = doc.add_paragraph()
+            _add_formatted_text(paragraph, line)
+
+
+def _add_formatted_text(paragraph, text: str) -> None:
+    parts = re.split(r"(\*\*.*?\*\*|\*.*?\*)", text)
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**"):
+            run = paragraph.add_run(part[2:-2])
+            run.bold = True
+        elif part.startswith("*") and part.endswith("*"):
+            run = paragraph.add_run(part[1:-1])
+            run.italic = True
+        else:
+            paragraph.add_run(part)
+
+
+def _markdown_images_for_chapter(
+    chapter: ChapterDraft,
+    image_assets: list[ImageAsset],
+    markdown_dir: Path,
+) -> list[str]:
+    parts: list[str] = []
+    for image in _chapter_images(chapter, image_assets):
+        if image.is_placeholder or not image.file_path:
+            label = image.alt_text or image.prompt_used or "Image placeholder"
+            parts.append(f"\n*[Image placeholder: {label}]*\n")
+            continue
+
+        image_path = Path(image.file_path)
+        try:
+            display_path = image_path.relative_to(markdown_dir)
+        except ValueError:
+            display_path = image_path
+        alt = image.alt_text or f"Image for {chapter.title}"
+        parts.append(f"\n![{alt}]({display_path.as_posix()})\n")
+    return parts
+
+
+def _add_docx_images_for_chapter(
+    doc: Document,
+    chapter: ChapterDraft,
+    image_assets: list[ImageAsset],
+) -> None:
+    for image in _chapter_images(chapter, image_assets):
+        if image.is_placeholder or not image.file_path:
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(
+                f"[Image placeholder: {image.alt_text or image.prompt_used}]"
+            )
+            run.italic = True
+            continue
+
+        image_path = Path(image.file_path)
+        if not image_path.exists():
+            paragraph = doc.add_paragraph()
+            run = paragraph.add_run(f"[Image missing: {image.alt_text}]")
+            run.italic = True
+            continue
+
+        doc.add_paragraph("")
+        doc.add_picture(str(image_path), width=Inches(5.5))
+        if image.alt_text:
+            caption = doc.add_paragraph(image.alt_text)
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in caption.runs:
+                run.font.italic = True
+                run.font.size = Pt(9)
+
+
+def _chapter_images(
+    chapter: ChapterDraft,
+    image_assets: list[ImageAsset],
+) -> list[ImageAsset]:
+    return [
+        image
+        for image in image_assets
+        if image.chapter_number == chapter.chapter_number
+    ]
 
 
 def _anchor(title: str) -> str:

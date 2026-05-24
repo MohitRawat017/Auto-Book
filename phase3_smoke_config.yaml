@@ -1,4 +1,4 @@
-# Cheap Phase 2 smoke-test configuration.
+# Cheap Phase 3 smoke-test configuration.
 
 llm:
   provider: "groq"
@@ -34,23 +34,23 @@ context_budget:
   total_max: 6000
 
 output:
-  directory: "./output/phase2_smoke"
+  directory: "./output/phase3_smoke"
   save_intermediate: true
 
 images:
-  enabled: false
+  enabled: true
   generate_actual: false
-  max_images_per_chapter: 0
+  max_images_per_chapter: 1
   default_model: "qwen2/text-to-image"
   default_size: "16:9"
   output_format: "png"
   timeout_seconds: 120
   poll_interval_seconds: 3
-  max_poll_attempts: 40
+  max_poll_attempts: 20
   fallback_to_placeholder: true
   call_back_url: ""
 
 logging:
   level: "INFO"
   log_to_file: true
-  log_file: "./output/phase2_smoke/run.log"
+  log_file: "./output/phase3_smoke/run.log"

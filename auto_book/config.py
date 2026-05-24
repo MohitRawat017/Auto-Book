@@ -72,6 +72,20 @@ class LoggingSettings(BaseModel):
     log_file: str = "./output/run.log"
 
 
+class ImageSettings(BaseModel):
+    enabled: bool = True
+    generate_actual: bool = True
+    max_images_per_chapter: int = 3
+    default_model: str = "qwen2/text-to-image"
+    default_size: str = "16:9"
+    output_format: str = "png"
+    timeout_seconds: int = 120
+    poll_interval_seconds: int = 3
+    max_poll_attempts: int = 40
+    fallback_to_placeholder: bool = True
+    call_back_url: str = ""
+
+
 class Settings(BaseModel):
     """All non-secret project settings loaded from config.yaml."""
 
@@ -81,6 +95,7 @@ class Settings(BaseModel):
     context_budget: ContextBudget = Field(default_factory=ContextBudget)
     output: OutputSettings = Field(default_factory=OutputSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    images: ImageSettings = Field(default_factory=ImageSettings)
 
 
 def load_settings(config_path: str = "config.yaml") -> Settings:

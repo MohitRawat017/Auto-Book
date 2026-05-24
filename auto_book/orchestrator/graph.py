@@ -5,13 +5,15 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 
-from auto_book.agents.assembler import assemble_markdown
+from auto_book.agents.assembler import assemble_docx, assemble_markdown
+from auto_book.agents.image_agent import run_image_agent
 from auto_book.agents.memory_updater import run_memory_update
 from auto_book.agents.planner import run_planner
 from auto_book.agents.reviewer import run_reviewer
 from auto_book.agents.writer import run_writer
 from auto_book.config import settings
 from auto_book.models.chapter import ChapterPlan
+from auto_book.models.export import ExportResult
 from auto_book.models.memory import DynamicMemory
 from auto_book.models.review import ReviewDecisionEnum
 from auto_book.models.run_state import ChapterStatus, RunPhase
@@ -311,12 +313,12 @@ def check_next(state: GraphState) -> dict[str, Any]:
 
 
 def assemble_book(state: GraphState) -> dict[str, Any]:
-    """Assemble accepted chapters into Markdown."""
+    """Run the Image Agent for accepted chapters before export."""
 
     logger = get_logger()
     bible = state.get("book_bible")
     if bible is None:
-        return {"phase": RunPhase.FAILED, "error": "No Book Bible to assemble."}
+        return {"phase": RunPhase.FAILED, "error": "No Book Bible for image planning."}
 
     accepted = [
         status.accepted_draft
@@ -324,30 +326,94 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
         if status.accepted_draft is not None
     ]
     if not accepted:
-        return {"phase": RunPhase.FAILED, "error": "No accepted chapters to assemble."}
+        return {"phase": RunPhase.FAILED, "error": "No accepted chapters for image planning."}
 
     try:
-        export_result = assemble_markdown(
-            bible,
+        image_assets = run_image_agent(
             accepted,
+            bible,
             state.get("output_directory", settings.output.directory),
         )
     except Exception as exc:
-        logger.error("Markdown assembly failed: %s", exc)
-        return {"phase": RunPhase.FAILED, "error": str(exc)}
+        logger.warning("Image Agent failed; proceeding without images: %s", exc)
+        image_assets = []
 
-    logger.info("Markdown assembly complete")
+    logger.info("Image planning/generation complete")
     return {
-        "export_result": export_result,
+        "image_assets": image_assets,
         "phase": RunPhase.ASSEMBLING,
     }
 
 
 def export_book(state: GraphState) -> dict[str, Any]:
-    """Mark the Markdown export complete."""
+    """Export accepted chapters to Markdown and DOCX."""
 
-    get_logger().info("Phase 2 Markdown export complete.")
-    return {"phase": RunPhase.COMPLETED}
+    logger = get_logger()
+    bible = state.get("book_bible")
+    if bible is None:
+        return {"phase": RunPhase.FAILED, "error": "No Book Bible to export."}
+
+    accepted = [
+        status.accepted_draft
+        for status in state.get("chapter_statuses", [])
+        if status.accepted_draft is not None
+    ]
+    if not accepted:
+        return {"phase": RunPhase.FAILED, "error": "No accepted chapters to export."}
+
+    output_dir = state.get("output_directory", settings.output.directory)
+    image_assets = state.get("image_assets", [])
+    errors: list[str] = []
+    markdown_path = ""
+    docx_path = ""
+    total_word_count = sum(chapter.word_count for chapter in accepted)
+
+    try:
+        markdown_result = assemble_markdown(
+            bible,
+            accepted,
+            output_dir,
+            image_assets=image_assets,
+        )
+        markdown_path = markdown_result.markdown_path
+        total_word_count = markdown_result.total_word_count
+    except Exception as exc:
+        logger.error("Markdown export failed: %s", exc)
+        errors.append(f"Markdown export failed: {exc}")
+
+    try:
+        docx_path = assemble_docx(
+            bible,
+            accepted,
+            output_dir,
+            image_assets=image_assets,
+        )
+    except Exception as exc:
+        logger.error("DOCX export failed: %s", exc)
+        errors.append(f"DOCX export failed: {exc}")
+
+    export_result = ExportResult(
+        markdown_path=markdown_path,
+        docx_path=docx_path,
+        total_chapters=len(accepted),
+        total_word_count=total_word_count,
+        images_embedded=sum(1 for asset in image_assets if not asset.is_placeholder),
+        success=not errors,
+        errors=errors,
+    )
+
+    if errors:
+        return {
+            "export_result": export_result,
+            "phase": RunPhase.FAILED,
+            "error": "; ".join(errors),
+        }
+
+    logger.info("Phase 3 Markdown and DOCX export complete.")
+    return {
+        "export_result": export_result,
+        "phase": RunPhase.COMPLETED,
+    }
 
 
 def handle_failure(state: GraphState) -> dict[str, Any]:
