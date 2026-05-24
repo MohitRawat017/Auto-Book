@@ -1,5 +1,6 @@
 """Writer Agent: writes one chapter at a time."""
 
+import re
 import time
 
 from auto_book.agents.llm_client import get_llm
@@ -37,6 +38,7 @@ CRITICAL RULES:
 7. Maintain continuity with previous chapters - don't repeat covered material.
 8. Match the tone and style guide strictly.
 {forbidden}
+{image_anchor_rules}
 """
 
 WRITER_USER_PROMPT = """Write Chapter {chapter_number}: "{title}".
@@ -71,6 +73,8 @@ PREVIOUS DRAFT TO REVISE:
 
 Now write the REVISED chapter incorporating all fixes:"""
 
+IMAGE_ANCHOR_PATTERN = re.compile(r"^\[IMAGE_ANCHOR:\s*([A-Z0-9_]+)\]\s*$")
+
 
 def run_writer(
     chapter_plan: ChapterPlan,
@@ -99,6 +103,7 @@ def run_writer(
         word_target=word_target,
         paragraph_estimate=paragraph_estimate,
         forbidden=forbidden,
+        image_anchor_rules=_build_image_anchor_rules(chapter_plan.chapter_number),
     )
 
     revision_section = ""
@@ -171,6 +176,7 @@ def run_writer(
                 _extract_message_text(response),
                 chapter_plan.title,
             )
+            body = _normalize_image_anchors(body)
             if len(body.split()) < max(50, settings.book.min_words_per_chapter // 2):
                 raise ValueError("Writer returned an empty or too-short chapter body.")
 
@@ -255,6 +261,27 @@ def _build_revision_section(feedback: list[str] | None) -> str:
     )
 
 
+def _build_image_anchor_rules(chapter_number: int) -> str:
+    max_images = max(0, settings.images.max_images_per_chapter)
+    if not settings.images.enabled or max_images == 0:
+        return "\nImage anchor rules:\n- Do not insert any [IMAGE_ANCHOR: ...] markers."
+
+    return f"""
+Image anchor rules:
+- Insert 1 to {max_images} image anchor line(s) where a visual would make a
+  complex concept easier to understand. Use no anchors only if no visual helps.
+- Each anchor MUST be alone on its own line with this exact format:
+  [IMAGE_ANCHOR: CH{chapter_number}_SHORT_DESCRIPTIVE_ID]
+- Anchor IDs must use only uppercase letters, numbers, and underscores.
+- Make anchor IDs semantic, e.g. CH{chapter_number}_BUDGET_SPLIT_DIAGRAM.
+- Do not write image prompts, captions, alt text, or image descriptions in the
+  chapter. The Image Agent will turn anchors and surrounding text into detailed
+  generation prompts later.
+- On revisions, preserve existing useful anchors unless they are clearly in the
+  wrong place.
+"""
+
+
 def _extract_message_text(response: object) -> str:
     """Extract text from a LangChain chat response."""
 
@@ -294,3 +321,36 @@ def _normalize_markdown_response(markdown: str, chapter_title: str) -> str:
         body = f"{expected_heading}\n\n{body}".strip()
 
     return body
+
+
+def _normalize_image_anchors(markdown: str) -> str:
+    """Keep only valid standalone anchors and enforce per-chapter limits."""
+
+    max_images = max(0, settings.images.max_images_per_chapter)
+    images_enabled = settings.images.enabled and max_images > 0
+    lines: list[str] = []
+    seen: set[str] = set()
+    kept = 0
+
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if "[IMAGE_ANCHOR:" not in stripped:
+            lines.append(line)
+            continue
+
+        if not images_enabled:
+            continue
+
+        match = IMAGE_ANCHOR_PATTERN.fullmatch(stripped)
+        if not match:
+            continue
+
+        anchor_id = match.group(1)
+        if anchor_id in seen or kept >= max_images:
+            continue
+
+        seen.add(anchor_id)
+        kept += 1
+        lines.append(f"[IMAGE_ANCHOR: {anchor_id}]")
+
+    return "\n".join(lines).strip()

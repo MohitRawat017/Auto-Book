@@ -1,4 +1,4 @@
-"""Image Agent: plans image placements and optionally generates images via KIE."""
+"""Image Agent: expands writer anchors into prompts and optional KIE images."""
 
 from __future__ import annotations
 
@@ -16,54 +16,63 @@ from auto_book.agents.llm_client import get_llm
 from auto_book.config import secrets, settings
 from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft
-from auto_book.models.image import ImageAsset, ImagePrompt
+from auto_book.models.image import ImageAnchor, ImageAsset, ImagePrompt
 from auto_book.utils.logger import get_logger
 from auto_book.utils.rate_limiter import wait_for_rate_limit
 from auto_book.utils.tokens import truncate_to_budget
 
 KIE_CREATE_TASK_URL = "https://api.kie.ai/api/v1/jobs/createTask"
 KIE_RECORD_INFO_URL = "https://api.kie.ai/api/v1/jobs/recordInfo"
+IMAGE_ANCHOR_PATTERN = re.compile(r"^\[IMAGE_ANCHOR:\s*([A-Z0-9_]+)\]\s*$")
 
-IMAGE_PLANNER_SYSTEM_PROMPT = """You are an art director for a book project.
+IMAGE_PROMPT_SYSTEM_PROMPT = """You are an expert AI image art director.
 
-Your job is to identify where images would improve reader understanding or
-engagement, then create specific image generation prompts.
+You receive exact image anchors written into a book chapter. Your job is NOT to
+choose placement. Your job is to turn the anchor and surrounding prose into a
+detailed text-to-image prompt for KIE/Qwen image generation.
 
 Book context:
 - Title: {title}
 - Genre: {genre}
+- Tone: {tone}
 - Image direction: {image_direction}
 
-Rules:
-- Suggest only images that genuinely add value.
-- Return {max_images} image prompt(s) maximum for this chapter.
-- Prefer useful visuals: diagrams, concept illustrations, worksheets, or
-  simple infographics for non-fiction; scene or character moments for fiction.
-- Make prompts detailed enough for a text-to-image model.
-- Include concise accessibility alt text.
+Prompt requirements:
+- Be specific and visual, not a short label.
+- Describe the visual type: infographic, diagram, worksheet, editorial
+  illustration, scene, concept map, etc.
+- Describe composition, main objects, layout, labels/text that should appear,
+  style, color direction, mood, and what to avoid.
+- Prefer readable diagrams and concept illustrations for non-fiction.
+- Avoid tiny unreadable text, brand logos, copyrighted characters, and clutter.
 - Return ONLY valid JSON, with no Markdown or code fences.
 
 Required JSON shape:
 {{
-  "images": [
-    {{
-      "chapter_number": 1,
-      "position": "after the introduction",
-      "prompt": "A clean editorial illustration...",
-      "style": "minimalist editorial illustration",
-      "alt_text": "Description for screen readers"
-    }}
-  ]
+  "anchor_id": "{anchor_id}",
+  "chapter_number": {chapter_number},
+  "position": "{marker}",
+  "prompt": "Detailed image generation prompt...",
+  "style": "concise style direction",
+  "alt_text": "Concise accessible description"
 }}
 """
 
-IMAGE_PLANNER_USER_PROMPT = """Analyze this chapter and suggest image placements:
+IMAGE_PROMPT_USER_PROMPT = """Create a detailed image prompt for this exact anchor.
 
-Chapter {chapter_number}: "{title}"
+Anchor ID: {anchor_id}
+Anchor meaning: {anchor_meaning}
+Chapter {chapter_number}: "{chapter_title}"
+Chapter summary: {chapter_summary}
+Nearest heading: {nearest_heading}
 
-{body_excerpt}
+Context before anchor:
+{context_before}
 
-Return only the image-plan JSON.
+Context after anchor:
+{context_after}
+
+Return only the JSON image prompt object.
 """
 
 
@@ -72,7 +81,7 @@ def run_image_agent(
     book_bible: BookBible,
     output_dir: str,
 ) -> list[ImageAsset]:
-    """Plan and optionally generate images for accepted chapters."""
+    """Parse writer anchors, create detailed prompts, and optionally generate images."""
 
     logger = get_logger()
     images_dir = Path(output_dir) / "images"
@@ -80,16 +89,31 @@ def run_image_agent(
 
     if not settings.images.enabled:
         logger.info("Image Agent disabled by config.")
+        _save_json(images_dir / "image_manifest.json", [])
         _save_json(images_dir / "image_plan.json", [])
         _save_json(images_dir / "image_assets.json", [])
         return []
 
+    ordered = sorted(chapters, key=lambda item: item.chapter_number)
+    anchors = extract_image_anchors(ordered)
+    _save_json(images_dir / "image_manifest.json", [anchor.model_dump() for anchor in anchors])
+
+    if not anchors:
+        logger.info("No image anchors found in accepted chapters.")
+        _save_json(images_dir / "image_plan.json", [])
+        _save_json(images_dir / "image_assets.json", [])
+        return []
+
+    chapter_by_number = {chapter.chapter_number: chapter for chapter in ordered}
     prompts: list[ImagePrompt] = []
-    for chapter in sorted(chapters, key=lambda item: item.chapter_number):
-        prompts.extend(plan_images_for_chapter(chapter, book_bible))
+    for anchor in anchors:
+        chapter = chapter_by_number.get(anchor.chapter_number)
+        if chapter is None:
+            continue
+        prompts.append(plan_image_for_anchor(anchor, chapter, book_bible))
 
     _save_json(images_dir / "image_plan.json", [prompt.model_dump() for prompt in prompts])
-    logger.info("Image planning complete: %s prompt(s)", len(prompts))
+    logger.info("Image prompt expansion complete: %s prompt(s)", len(prompts))
 
     assets: list[ImageAsset] = []
     for prompt in prompts:
@@ -104,28 +128,70 @@ def run_image_agent(
     return assets
 
 
-def plan_images_for_chapter(
+def extract_image_anchors(chapters: list[ChapterDraft]) -> list[ImageAnchor]:
+    """Parse exact standalone image anchors from accepted chapter Markdown."""
+
+    anchors: list[ImageAnchor] = []
+    seen: set[str] = set()
+    for chapter in sorted(chapters, key=lambda item: item.chapter_number):
+        lines = chapter.body.splitlines()
+        nearest_heading = ""
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                nearest_heading = stripped.lstrip("#").strip()
+
+            match = IMAGE_ANCHOR_PATTERN.fullmatch(stripped)
+            if not match:
+                continue
+
+            anchor_id = match.group(1)
+            if anchor_id in seen:
+                continue
+            seen.add(anchor_id)
+            anchors.append(
+                ImageAnchor(
+                    anchor_id=anchor_id,
+                    chapter_number=chapter.chapter_number,
+                    marker=f"[IMAGE_ANCHOR: {anchor_id}]",
+                    nearest_heading=nearest_heading,
+                    context_before=_nearby_paragraph(lines, index, direction=-1),
+                    context_after=_nearby_paragraph(lines, index, direction=1),
+                )
+            )
+
+    get_logger().info("Parsed %s image anchor(s)", len(anchors))
+    return anchors
+
+
+def plan_image_for_anchor(
+    anchor: ImageAnchor,
     draft: ChapterDraft,
     book_bible: BookBible,
-) -> list[ImagePrompt]:
-    """Use an LLM to create image prompts for one accepted chapter."""
-
-    max_images = max(0, settings.images.max_images_per_chapter)
-    if max_images == 0:
-        return []
+) -> ImagePrompt:
+    """Create a detailed image prompt from an exact writer anchor."""
 
     logger = get_logger()
-    system_msg = IMAGE_PLANNER_SYSTEM_PROMPT.format(
+    chapter_summary = _chapter_summary(book_bible, draft)
+    system_msg = IMAGE_PROMPT_SYSTEM_PROMPT.format(
         title=book_bible.working_title,
         genre=book_bible.genre,
+        tone=book_bible.tone,
         image_direction=book_bible.image_direction
         or "Clean, professional editorial illustrations.",
-        max_images=max_images,
+        anchor_id=anchor.anchor_id,
+        chapter_number=anchor.chapter_number,
+        marker=anchor.marker,
     )
-    user_msg = IMAGE_PLANNER_USER_PROMPT.format(
-        chapter_number=draft.chapter_number,
-        title=draft.title,
-        body_excerpt=truncate_to_budget(draft.body, 1800),
+    user_msg = IMAGE_PROMPT_USER_PROMPT.format(
+        anchor_id=anchor.anchor_id,
+        anchor_meaning=anchor.anchor_id.replace("_", " ").title(),
+        chapter_number=anchor.chapter_number,
+        chapter_title=draft.title,
+        chapter_summary=chapter_summary,
+        nearest_heading=anchor.nearest_heading or draft.title,
+        context_before=anchor.context_before or "(No preceding context.)",
+        context_after=anchor.context_after or "(No following context.)",
     )
 
     try:
@@ -137,32 +203,21 @@ def plan_images_for_chapter(
             ]
         )
         payload = _load_json_object(_strip_code_fence(_extract_message_text(response)))
-        raw_images = payload.get("images", [])
-        if not isinstance(raw_images, list):
-            raise ValueError("Image planner returned a non-list images field.")
-
-        prompts = []
-        for raw in raw_images[:max_images]:
-            if not isinstance(raw, dict):
-                continue
-            raw["chapter_number"] = draft.chapter_number
-            prompts.append(ImagePrompt.model_validate(raw))
-
-        if prompts:
-            logger.info(
-                "Image plan for chapter %s: %s prompt(s)",
-                draft.chapter_number,
-                len(prompts),
-            )
-            return prompts
+        payload["anchor_id"] = anchor.anchor_id
+        payload["chapter_number"] = anchor.chapter_number
+        payload["position"] = anchor.marker
+        prompt = ImagePrompt.model_validate(payload)
+        if len(prompt.prompt.split()) < 35:
+            raise ValueError("Image prompt was too short to be useful.")
+        logger.info("Image prompt created for %s", anchor.anchor_id)
+        return prompt
     except Exception as exc:
         logger.warning(
-            "Image planning failed for chapter %s: %s. Using fallback prompt.",
-            draft.chapter_number,
+            "Image prompt expansion failed for %s: %s. Using fallback prompt.",
+            anchor.anchor_id,
             exc,
         )
-
-    return [_fallback_image_prompt(draft, book_bible)]
+        return _fallback_image_prompt(anchor, draft, book_bible, chapter_summary)
 
 
 def generate_image_via_kie(prompt: ImagePrompt, output_dir: str) -> ImageAsset:
@@ -189,8 +244,9 @@ def generate_image_via_kie(prompt: ImagePrompt, output_dir: str) -> ImageAsset:
             file_path.write_bytes(response.content)
             _normalize_image_file(file_path)
 
-        logger.info("Image generated for chapter %s: %s", prompt.chapter_number, file_path)
+        logger.info("Image generated for %s: %s", prompt.anchor_id, file_path)
         return ImageAsset(
+            anchor_id=prompt.anchor_id,
             chapter_number=prompt.chapter_number,
             position=prompt.position,
             file_path=str(file_path),
@@ -199,7 +255,7 @@ def generate_image_via_kie(prompt: ImagePrompt, output_dir: str) -> ImageAsset:
             is_placeholder=False,
         )
     except Exception as exc:
-        logger.warning("Image generation failed for chapter %s: %s", prompt.chapter_number, exc)
+        logger.warning("Image generation failed for %s: %s", prompt.anchor_id, exc)
         if settings.images.fallback_to_placeholder:
             return _placeholder_asset(prompt, str(exc))
         raise
@@ -264,6 +320,29 @@ def _poll_kie_result(client: httpx.Client, task_id: str) -> str:
     raise TimeoutError(f"KIE task {task_id} did not complete before polling timeout.")
 
 
+def _nearby_paragraph(lines: list[str], anchor_index: int, direction: int) -> str:
+    indexes = (
+        range(anchor_index - 1, -1, -1)
+        if direction < 0
+        else range(anchor_index + 1, len(lines))
+    )
+    for index in indexes:
+        stripped = lines[index].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if IMAGE_ANCHOR_PATTERN.fullmatch(stripped):
+            continue
+        return truncate_to_budget(stripped, 220)
+    return ""
+
+
+def _chapter_summary(book_bible: BookBible, draft: ChapterDraft) -> str:
+    for chapter in book_bible.chapter_outline:
+        if chapter.chapter_number == draft.chapter_number:
+            return chapter.summary
+    return draft.title
+
+
 def _first_result_url(result_json: object) -> str:
     if isinstance(result_json, str):
         try:
@@ -292,29 +371,43 @@ def _normalize_image_file(path: Path) -> None:
         image.save(path, format="PNG", optimize=True)
 
 
-def _fallback_image_prompt(draft: ChapterDraft, book_bible: BookBible) -> ImagePrompt:
+def _fallback_image_prompt(
+    anchor: ImageAnchor,
+    draft: ChapterDraft,
+    book_bible: BookBible,
+    chapter_summary: str,
+) -> ImagePrompt:
+    anchor_meaning = anchor.anchor_id.replace("_", " ").title()
+    prompt = (
+        f"Create a polished, useful book illustration for anchor {anchor.anchor_id} "
+        f"in Chapter {draft.chapter_number}, '{draft.title}', from the book "
+        f"'{book_bible.working_title}'. The visual should explain this concept: "
+        f"{anchor_meaning}. Use the chapter summary as context: {chapter_summary}. "
+        f"Ground the image in the nearby text before the anchor: {anchor.context_before}. "
+        f"Also reflect the following text after the anchor: {anchor.context_after}. "
+        "Use a clear editorial infographic or concept illustration layout with a "
+        "strong focal point, clean spacing, simple readable labels, and no clutter. "
+        f"Match this style direction: {book_bible.image_direction or 'modern, professional, accessible'}. "
+        "Avoid brand logos, tiny dense text, sensational imagery, and unrelated decorative filler."
+    )
     return ImagePrompt(
-        chapter_number=draft.chapter_number,
-        position="after the chapter introduction",
-        prompt=(
-            f"Create a clean editorial illustration for Chapter {draft.chapter_number}, "
-            f"'{draft.title}', in the book '{book_bible.working_title}'. "
-            f"Visualize the chapter's central idea in a useful, non-decorative way. "
-            f"Style direction: {book_bible.image_direction or 'professional, clear, modern'}."
-        ),
-        style=book_bible.image_direction or "clean editorial illustration",
-        alt_text=f"Illustration summarizing the main idea of {draft.title}.",
+        anchor_id=anchor.anchor_id,
+        chapter_number=anchor.chapter_number,
+        position=anchor.marker,
+        prompt=prompt,
+        style=book_bible.image_direction or "clean editorial infographic",
+        alt_text=f"Illustration explaining {anchor_meaning}.",
     )
 
 
 def _placeholder_asset(prompt: ImagePrompt, reason: str) -> ImageAsset:
     get_logger().info(
-        "Using image placeholder for chapter %s at %s: %s",
-        prompt.chapter_number,
-        prompt.position,
+        "Using image placeholder for %s: %s",
+        prompt.anchor_id or prompt.position,
         reason,
     )
     return ImageAsset(
+        anchor_id=prompt.anchor_id,
         chapter_number=prompt.chapter_number,
         position=prompt.position,
         prompt_used=prompt.prompt,
@@ -324,9 +417,9 @@ def _placeholder_asset(prompt: ImagePrompt, reason: str) -> ImageAsset:
 
 
 def _image_filename(prompt: ImagePrompt) -> str:
-    safe_position = re.sub(r"[^a-zA-Z0-9]+", "_", prompt.position).strip("_").lower()
-    safe_position = safe_position[:32] or "image"
-    return f"chapter_{prompt.chapter_number:02d}_{safe_position}.png"
+    base = prompt.anchor_id or f"chapter_{prompt.chapter_number:02d}_image"
+    safe_name = re.sub(r"[^A-Z0-9_]+", "_", base.upper()).strip("_")
+    return f"{safe_name or 'IMAGE'}.png"
 
 
 def _kie_headers() -> dict[str, str]:
@@ -376,7 +469,7 @@ def _load_json_object(text: str) -> dict[str, Any]:
         data = json.loads(text[start : end + 1])
 
     if not isinstance(data, dict):
-        raise ValueError("Image planner returned JSON, but not an object.")
+        raise ValueError("Image prompt planner returned JSON, but not an object.")
     return data
 
 

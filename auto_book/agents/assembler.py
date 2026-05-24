@@ -13,6 +13,8 @@ from auto_book.models.export import ExportResult
 from auto_book.models.image import ImageAsset
 from auto_book.utils.logger import get_logger
 
+IMAGE_ANCHOR_PATTERN = re.compile(r"^\[IMAGE_ANCHOR:\s*([A-Z0-9_]+)\]\s*$")
+
 
 def assemble_markdown(
     book_bible: BookBible,
@@ -46,8 +48,13 @@ def assemble_markdown(
 
     for chapter in ordered:
         parts.append(f"\n## Chapter {chapter.chapter_number}: {chapter.title}\n")
-        parts.append(_strip_duplicate_title(chapter))
-        parts.extend(_markdown_images_for_chapter(chapter, images, output_path.parent))
+        parts.append(
+            _replace_markdown_anchors(
+                _strip_duplicate_title(chapter),
+                images,
+                output_path.parent,
+            )
+        )
         if chapter.key_takeaways:
             parts.append("\n### Key Takeaways\n")
             parts.extend(f"- {takeaway}" for takeaway in chapter.key_takeaways)
@@ -133,8 +140,7 @@ def _add_chapter(
     image_assets: list[ImageAsset],
 ) -> None:
     doc.add_heading(f"Chapter {chapter.chapter_number}: {chapter.title}", level=1)
-    _add_markdown_body(doc, _strip_duplicate_title(chapter))
-    _add_docx_images_for_chapter(doc, chapter, image_assets)
+    _add_markdown_body(doc, _strip_duplicate_title(chapter), image_assets)
 
     if chapter.key_takeaways:
         doc.add_heading("Key Takeaways", level=3)
@@ -142,12 +148,20 @@ def _add_chapter(
             doc.add_paragraph(takeaway, style="List Bullet")
 
 
-def _add_markdown_body(doc: Document, markdown: str) -> None:
+def _add_markdown_body(
+    doc: Document,
+    markdown: str,
+    image_assets: list[ImageAsset],
+) -> None:
     for raw_line in markdown.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("### "):
+
+        anchor_match = IMAGE_ANCHOR_PATTERN.fullmatch(line)
+        if anchor_match:
+            _add_docx_anchor_image(doc, anchor_match.group(1), image_assets)
+        elif line.startswith("### "):
             doc.add_heading(line[4:], level=3)
         elif line.startswith("## "):
             doc.add_heading(line[3:], level=2)
@@ -177,68 +191,88 @@ def _add_formatted_text(paragraph, text: str) -> None:
             paragraph.add_run(part)
 
 
-def _markdown_images_for_chapter(
-    chapter: ChapterDraft,
+def _replace_markdown_anchors(
+    markdown: str,
     image_assets: list[ImageAsset],
     markdown_dir: Path,
-) -> list[str]:
-    parts: list[str] = []
-    for image in _chapter_images(chapter, image_assets):
-        if image.is_placeholder or not image.file_path:
-            label = image.alt_text or image.prompt_used or "Image placeholder"
-            parts.append(f"\n*[Image placeholder: {label}]*\n")
+) -> str:
+    lines: list[str] = []
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        match = IMAGE_ANCHOR_PATTERN.fullmatch(line)
+        if not match:
+            lines.append(raw_line)
             continue
 
-        image_path = Path(image.file_path)
-        try:
-            display_path = image_path.relative_to(markdown_dir)
-        except ValueError:
-            display_path = image_path
-        alt = image.alt_text or f"Image for {chapter.title}"
-        parts.append(f"\n![{alt}]({display_path.as_posix()})\n")
-    return parts
+        lines.append(_markdown_for_anchor(match.group(1), image_assets, markdown_dir))
+    return "\n".join(lines).strip()
 
 
-def _add_docx_images_for_chapter(
+def _markdown_for_anchor(
+    anchor_id: str,
+    image_assets: list[ImageAsset],
+    markdown_dir: Path,
+) -> str:
+    image = _image_for_anchor(anchor_id, image_assets)
+    if image is None or image.is_placeholder or not image.file_path:
+        label = (
+            image.alt_text if image else ""
+        ) or (
+            image.prompt_used if image else ""
+        ) or anchor_id.replace("_", " ").title()
+        return f"*[Image placeholder: {label}]*"
+
+    image_path = Path(image.file_path)
+    try:
+        display_path = image_path.relative_to(markdown_dir)
+    except ValueError:
+        display_path = image_path
+    alt = image.alt_text or anchor_id.replace("_", " ").title()
+    return f"![{alt}]({display_path.as_posix()})"
+
+
+def _add_docx_anchor_image(
     doc: Document,
-    chapter: ChapterDraft,
+    anchor_id: str,
     image_assets: list[ImageAsset],
 ) -> None:
-    for image in _chapter_images(chapter, image_assets):
-        if image.is_placeholder or not image.file_path:
-            paragraph = doc.add_paragraph()
-            run = paragraph.add_run(
-                f"[Image placeholder: {image.alt_text or image.prompt_used}]"
-            )
-            run.italic = True
-            continue
+    image = _image_for_anchor(anchor_id, image_assets)
+    if image is None or image.is_placeholder or not image.file_path:
+        label = (
+            image.alt_text if image else ""
+        ) or (
+            image.prompt_used if image else ""
+        ) or anchor_id.replace("_", " ").title()
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(f"[Image placeholder: {label}]")
+        run.italic = True
+        return
 
-        image_path = Path(image.file_path)
-        if not image_path.exists():
-            paragraph = doc.add_paragraph()
-            run = paragraph.add_run(f"[Image missing: {image.alt_text}]")
-            run.italic = True
-            continue
+    image_path = Path(image.file_path)
+    if not image_path.exists():
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run(f"[Image missing: {image.alt_text or anchor_id}]")
+        run.italic = True
+        return
 
-        doc.add_paragraph("")
-        doc.add_picture(str(image_path), width=Inches(5.5))
-        if image.alt_text:
-            caption = doc.add_paragraph(image.alt_text)
-            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            for run in caption.runs:
-                run.font.italic = True
-                run.font.size = Pt(9)
+    doc.add_paragraph("")
+    doc.add_picture(str(image_path), width=Inches(5.5))
+    if image.alt_text:
+        caption = doc.add_paragraph(image.alt_text)
+        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in caption.runs:
+            run.font.italic = True
+            run.font.size = Pt(9)
 
 
-def _chapter_images(
-    chapter: ChapterDraft,
+def _image_for_anchor(
+    anchor_id: str,
     image_assets: list[ImageAsset],
-) -> list[ImageAsset]:
-    return [
-        image
-        for image in image_assets
-        if image.chapter_number == chapter.chapter_number
-    ]
+) -> ImageAsset | None:
+    for image in image_assets:
+        if image.anchor_id == anchor_id:
+            return image
+    return None
 
 
 def _anchor(title: str) -> str:
