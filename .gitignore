@@ -13,3 +13,5 @@ PLAN/
 # Local configuration and generated outputs
 .env
 output/
+_diag.py
+graphify.py
