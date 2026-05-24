@@ -45,10 +45,10 @@ class BookSettings(BaseModel):
 
 
 class RetrySettings(BaseModel):
-    max_revisions: int = 2
+    max_revisions: int = 3
     max_regenerations: int = 1
     max_validation_retries: int = 3
-    retry_delay_seconds: int = 2
+    retry_delay_seconds: int = 6
 
 
 class ContextBudget(BaseModel):

@@ -33,6 +33,8 @@ def setup_logger(
 ) -> logging.Logger:
     """Create and configure the application logger."""
 
+    _configure_console_encoding()
+
     logger = logging.getLogger("auto_book")
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
     logger.handlers.clear()
@@ -60,3 +62,15 @@ def get_logger() -> logging.Logger:
     """Return the application logger."""
 
     return logging.getLogger("auto_book")
+
+
+def _configure_console_encoding() -> None:
+    """Avoid Windows console crashes when model output contains Unicode."""
+
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if not reconfigure:
+        return
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        return

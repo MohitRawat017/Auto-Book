@@ -1,6 +1,9 @@
 """Reviewer Agent: evaluates chapter quality."""
 
+import json
 import time
+from json import JSONDecodeError
+from typing import Any
 
 from auto_book.agents.llm_client import get_llm
 from auto_book.config import settings
@@ -17,7 +20,7 @@ REVIEWER_SYSTEM_PROMPT = """You are a strict but constructive book editor.
 
 Evaluate a chapter draft against the Book Bible and previous chapter summaries.
 
-SCORING CALIBRATION — follow these examples precisely:
+SCORING CALIBRATION - follow these examples precisely:
 - Score 9-10 (pass): Excellent. Reads like a polished book chapter. Rich prose,
   strong examples, good flow, meets word target. Very rare.
 - Score 7-8 (pass): Good. Covers the topic well, has decent prose, roughly meets
@@ -38,6 +41,22 @@ DECISION RULES:
   You MUST list concrete required_fixes. Only request revisions for
   OBJECTIVE issues, not stylistic preferences.
 - fail (score 0-4): Chapter misses the goal entirely. Needs full regeneration.
+
+Return ONLY valid JSON. Do not return Markdown, code fences, comments, or a
+tool/function call. Every list field must be a JSON array of strings.
+
+Required JSON shape:
+{{
+  "chapter_number": {chapter_number},
+  "decision": "pass",
+  "score": 8,
+  "problems": [],
+  "required_fixes": [],
+  "suggested_edits": [],
+  "continuity_issues": [],
+  "research_gaps": [],
+  "tone_match": true
+}}
 
 {revision_context}
 
@@ -60,9 +79,17 @@ REVIEWER_USER_PROMPT = """Review this chapter draft:
 
 {continuity_context}
 
-Return a structured ReviewDecision. Be fair — if the chapter covers its topic
+Return only the ReviewDecision JSON. Be fair - if the chapter covers its topic
 with reasonable prose and approximately meets the word target, score it 7+.
 """
+
+LIST_FIELDS = (
+    "problems",
+    "required_fixes",
+    "suggested_edits",
+    "continuity_issues",
+    "research_gaps",
+)
 
 
 def run_reviewer(
@@ -86,7 +113,6 @@ def run_reviewer(
     chapter_summary = outline.summary if outline else "No chapter summary available."
     word_target = outline.word_count_target if outline else settings.book.target_words_per_chapter
 
-    # Revision-aware context: relax standards after first revision
     revision_context = ""
     if revision_count >= 2:
         revision_context = (
@@ -127,23 +153,23 @@ def run_reviewer(
     )
 
     llm = get_llm("reviewer")
-    structured_llm = llm.with_structured_output(ReviewDecision)
 
     last_error: Exception | None = None
     for attempt in range(1, settings.retry.max_validation_retries + 1):
         try:
             logger.info("Reviewer attempt %s for chapter %s", attempt, draft.chapter_number)
             wait_for_rate_limit()
-            result = structured_llm.invoke(
+            response = llm.invoke(
                 [
                     ("system", system_msg),
                     ("human", user_msg),
                 ]
             )
-            if not isinstance(result, ReviewDecision):
-                result = ReviewDecision.model_validate(result)
+            result = _parse_review_decision(
+                _extract_message_text(response),
+                draft.chapter_number,
+            )
 
-            result.chapter_number = draft.chapter_number
             errors = validate_review_decision(result)
             if errors:
                 raise ValueError("; ".join(errors))
@@ -186,3 +212,73 @@ def _build_review_continuity(memory: DynamicMemory) -> str:
         lines.extend(f"- {warning}" for warning in memory.repetition_warnings)
 
     return truncate_to_budget("\n".join(lines), settings.context_budget.dynamic_memory)
+
+
+def _extract_message_text(response: object) -> str:
+    """Extract text from a LangChain chat response."""
+
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_review_decision(raw_text: str, chapter_number: int) -> ReviewDecision:
+    payload = _load_json_object(_strip_code_fence(raw_text))
+    if isinstance(payload.get("arguments"), dict):
+        payload = payload["arguments"]
+
+    payload["chapter_number"] = chapter_number
+    for field in LIST_FIELDS:
+        payload[field] = _coerce_string_list(payload.get(field))
+    payload["tone_match"] = bool(payload.get("tone_match", True))
+
+    return ReviewDecision.model_validate(payload)
+
+
+def _strip_code_fence(text: str) -> str:
+    body = text.strip()
+    if body.startswith("```"):
+        lines = body.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        body = "\n".join(lines).strip()
+    return body
+
+
+def _load_json_object(text: str) -> dict[str, Any]:
+    try:
+        data = json.loads(text)
+    except JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        data = json.loads(text[start : end + 1])
+
+    if not isinstance(data, dict):
+        raise ValueError("Reviewer returned JSON, but not an object.")
+    return data
+
+
+def _coerce_string_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        lines = [line.strip(" -0123456789.") for line in value.splitlines()]
+        return [line for line in lines if line]
+    return [str(value).strip()] if str(value).strip() else []

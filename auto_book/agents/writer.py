@@ -22,18 +22,19 @@ Book context:
 - Style guide: {style_guide}
 
 CRITICAL RULES:
-1. Write ONLY the requested chapter. Return a ChapterDraft object.
-2. Put the FULL chapter text in the "body" field as clean Markdown.
-3. Start body with a single # chapter heading, use ## for sections.
+1. Write ONLY the requested chapter.
+2. Return ONLY the complete chapter Markdown. Do not return JSON, XML,
+   tool/function calls, metadata, commentary, or code fences.
+3. Start with a single # chapter heading, use ## for sections.
 4. You MUST write AT LEAST {word_target} words. This is NON-NEGOTIABLE.
    Count your paragraphs: each paragraph is ~80-100 words, so {word_target} words
    means at least {paragraph_estimate} substantial paragraphs of flowing prose.
-5. Write in FLOWING PROSE — full paragraphs with rich detail, anecdotes, and
+5. Write in FLOWING PROSE - full paragraphs with rich detail, anecdotes, and
    examples. DO NOT write bullet-point lists or skeletal outlines. Each
    paragraph should be 3-5 sentences minimum.
 6. Use storytelling: open sections with a relatable scenario or question,
    explain concepts through examples, and close with actionable takeaways.
-7. Maintain continuity with previous chapters — don't repeat covered material.
+7. Maintain continuity with previous chapters - don't repeat covered material.
 8. Match the tone and style guide strictly.
 {forbidden}
 """
@@ -52,14 +53,14 @@ Key topics to cover:
 
 {previous_draft_section}
 
-Write the COMPLETE chapter now. Remember: minimum {word_target} words of flowing prose.
+Write the COMPLETE chapter now as Markdown only. Remember: minimum {word_target} words of flowing prose.
 """
 
-REVISION_PREAMBLE = """REVISION INSTRUCTIONS — This is attempt #{revision_number}.
+REVISION_PREAMBLE = """REVISION INSTRUCTIONS - This is attempt #{revision_number}.
 The reviewer identified these specific issues that MUST be fixed:
 {feedback}
 
-Your previous draft is shown below. DO NOT start from scratch — instead, REVISE
+Your previous draft is shown below. DO NOT start from scratch - instead, REVISE
 and EXPAND the existing draft to address each issue above. Keep what works,
 fix what doesn't, and add the missing content.
 
@@ -100,7 +101,6 @@ def run_writer(
         forbidden=forbidden,
     )
 
-    # Build revision section — now includes the PREVIOUS DRAFT
     revision_section = ""
     previous_draft_section = ""
     if revision_feedback and previous_draft:
@@ -155,25 +155,33 @@ def run_writer(
     )
 
     llm = get_llm("writer")
-    structured_llm = llm.with_structured_output(ChapterDraft)
 
     last_error: Exception | None = None
     for attempt in range(1, settings.retry.max_validation_retries + 1):
         try:
             logger.info("Writer attempt %s for chapter %s", attempt, chapter_plan.chapter_number)
             wait_for_rate_limit()
-            result = structured_llm.invoke(
+            response = llm.invoke(
                 [
                     ("system", system_msg),
                     ("human", user_msg),
                 ]
             )
-            if not isinstance(result, ChapterDraft):
-                result = ChapterDraft.model_validate(result)
+            body = _normalize_markdown_response(
+                _extract_message_text(response),
+                chapter_plan.title,
+            )
+            if len(body.split()) < max(50, settings.book.min_words_per_chapter // 2):
+                raise ValueError("Writer returned an empty or too-short chapter body.")
 
-            result.chapter_number = chapter_plan.chapter_number
-            if not result.title.strip():
-                result.title = chapter_plan.title
+            result = ChapterDraft(
+                chapter_number=chapter_plan.chapter_number,
+                title=chapter_plan.title,
+                body=body,
+                key_takeaways=chapter_plan.key_topics.copy(),
+                image_placeholders=[],
+                sources_referenced=[],
+            )
 
             errors = validate_chapter_draft(
                 result,
@@ -245,3 +253,44 @@ def _build_revision_section(feedback: list[str] | None) -> str:
     return "Revision feedback to address:\n" + "\n".join(
         f"- {item}" for item in feedback
     )
+
+
+def _extract_message_text(response: object) -> str:
+    """Extract text from a LangChain chat response."""
+
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _normalize_markdown_response(markdown: str, chapter_title: str) -> str:
+    """Clean plain-text LLM output and ensure a stable chapter heading."""
+
+    body = markdown.strip()
+    if body.startswith("```"):
+        lines = body.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        body = "\n".join(lines).strip()
+
+    expected_heading = f"# {chapter_title}"
+    first_line = body.splitlines()[0].strip() if body else ""
+    if first_line != expected_heading:
+        if first_line.startswith("# "):
+            body = "\n".join(body.splitlines()[1:]).strip()
+        body = f"{expected_heading}\n\n{body}".strip()
+
+    return body
