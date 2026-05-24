@@ -9,7 +9,11 @@ from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft, ChapterPlan
 from auto_book.models.memory import DynamicMemory
 from auto_book.utils.logger import get_logger
-from auto_book.utils.rate_limiter import wait_for_rate_limit
+from auto_book.utils.rate_limiter import (
+    raise_if_rate_limited,
+    record_success,
+    wait_for_rate_limit,
+)
 from auto_book.utils.tokens import count_tokens, truncate_to_budget
 from auto_book.utils.validation import validate_chapter_draft
 
@@ -27,9 +31,10 @@ CRITICAL RULES:
 2. Return ONLY the complete chapter Markdown. Do not return JSON, XML,
    tool/function calls, metadata, commentary, or code fences.
 3. Start with a single # chapter heading, use ## for sections.
-4. You MUST write AT LEAST {word_target} words. This is NON-NEGOTIABLE.
-   Count your paragraphs: each paragraph is ~80-100 words, so {word_target} words
-   means at least {paragraph_estimate} substantial paragraphs of flowing prose.
+4. Write between {min_words} and {word_target} words, targeting exactly {word_target}.
+   Do NOT exceed {word_target} words. Count your paragraphs: each paragraph is
+   ~80-100 words, so {word_target} words means about {paragraph_estimate}
+   substantial paragraphs of flowing prose.
 5. Write in FLOWING PROSE - full paragraphs with rich detail, anecdotes, and
    examples. DO NOT write bullet-point lists or skeletal outlines. Each
    paragraph should be 3-5 sentences minimum.
@@ -37,6 +42,10 @@ CRITICAL RULES:
    explain concepts through examples, and close with actionable takeaways.
 7. Maintain continuity with previous chapters - don't repeat covered material.
 8. Match the tone and style guide strictly.
+9. Before returning, silently self-review the chapter against this checklist:
+   all key topics are covered, examples are concrete, transitions are smooth,
+   the promise of the chapter is fulfilled, image anchors follow the rules, and
+   the word count is inside the allowed range. Return only the polished final.
 {forbidden}
 {image_anchor_rules}
 """
@@ -53,9 +62,7 @@ Key topics to cover:
 
 {revision_section}
 
-{previous_draft_section}
-
-Write the COMPLETE chapter now as Markdown only. Remember: minimum {word_target} words of flowing prose.
+Write the COMPLETE chapter now as Markdown only. Remember: this draft should be good enough to pass in one review.
 """
 
 REVISION_PREAMBLE = """REVISION INSTRUCTIONS - This is attempt #{revision_number}.
@@ -101,13 +108,13 @@ def run_writer(
         tone=book_bible.tone,
         style_guide=book_bible.style_guide,
         word_target=word_target,
+        min_words=settings.book.min_words_per_chapter,
         paragraph_estimate=paragraph_estimate,
         forbidden=forbidden,
         image_anchor_rules=_build_image_anchor_rules(chapter_plan.chapter_number),
     )
 
     revision_section = ""
-    previous_draft_section = ""
     if revision_feedback and previous_draft:
         revision_section = REVISION_PREAMBLE.format(
             revision_number=revision_number,
@@ -127,7 +134,6 @@ def run_writer(
         topics="\n".join(f"- {topic}" for topic in chapter_plan.key_topics),
         continuity_section=continuity,
         revision_section=revision_section,
-        previous_draft_section=previous_draft_section,
         word_target=word_target,
     )
 
@@ -149,7 +155,6 @@ def run_writer(
             topics="\n".join(f"- {topic}" for topic in chapter_plan.key_topics),
             continuity_section=continuity,
             revision_section=revision_section,
-            previous_draft_section=previous_draft_section,
             word_target=word_target,
         )
 
@@ -172,6 +177,7 @@ def run_writer(
                     ("human", user_msg),
                 ]
             )
+            record_success()
             body = _normalize_markdown_response(
                 _extract_message_text(response),
                 chapter_plan.title,
@@ -192,7 +198,7 @@ def run_writer(
             errors = validate_chapter_draft(
                 result,
                 settings.book.min_words_per_chapter,
-                settings.book.max_words_per_chapter,
+                word_target,
             )
             if errors and attempt < settings.retry.max_validation_retries:
                 raise ValueError("; ".join(errors))
@@ -211,6 +217,7 @@ def run_writer(
             )
             return result
         except Exception as exc:
+            raise_if_rate_limited(exc)
             last_error = exc
             logger.warning(
                 "Writer attempt %s for chapter %s failed: %s",
@@ -268,12 +275,14 @@ def _build_image_anchor_rules(chapter_number: int) -> str:
 
     return f"""
 Image anchor rules:
-- Insert 1 to {max_images} image anchor line(s) where a visual would make a
-  complex concept easier to understand. Use no anchors only if no visual helps.
+- Insert EXACTLY 2 to {max_images} image anchors per chapter — no fewer than 2, no more than {max_images}.
+- Place anchors where a diagram, chart, infographic, or visual would genuinely
+  help the reader understand a concept — not just for decoration.
 - Each anchor MUST be alone on its own line with this exact format:
   [IMAGE_ANCHOR: CH{chapter_number}_SHORT_DESCRIPTIVE_ID]
 - Anchor IDs must use only uppercase letters, numbers, and underscores.
-- Make anchor IDs semantic, e.g. CH{chapter_number}_BUDGET_SPLIT_DIAGRAM.
+- Make anchor IDs semantic and specific, e.g. CH{chapter_number}_BUDGET_SPLIT_DIAGRAM,
+  CH{chapter_number}_WORKFLOW_STEPS, CH{chapter_number}_COMPARISON_TABLE.
 - Do not write image prompts, captions, alt text, or image descriptions in the
   chapter. The Image Agent will turn anchors and surrounding text into detailed
   generation prompts later.

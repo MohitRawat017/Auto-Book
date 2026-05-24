@@ -12,7 +12,11 @@ from auto_book.models.chapter import ChapterDraft
 from auto_book.models.memory import DynamicMemory
 from auto_book.models.review import ReviewDecision
 from auto_book.utils.logger import get_logger
-from auto_book.utils.rate_limiter import wait_for_rate_limit
+from auto_book.utils.rate_limiter import (
+    raise_if_rate_limited,
+    record_success,
+    wait_for_rate_limit,
+)
 from auto_book.utils.tokens import count_tokens, truncate_to_budget
 from auto_book.utils.validation import validate_review_decision
 
@@ -22,15 +26,15 @@ Evaluate a chapter draft against the Book Bible and previous chapter summaries.
 
 SCORING CALIBRATION - follow these examples precisely:
 - Score 9-10 (pass): Excellent. Reads like a polished book chapter. Rich prose,
-  strong examples, good flow, meets word target. Very rare.
+  strong examples, good flow, meets the {word_target}-word target. Very rare.
 - Score 7-8 (pass): Good. Covers the topic well, has decent prose, roughly meets
-  the word target. Minor suggestions only. THIS IS THE EXPECTED RANGE for
-  a competent draft.
-- Score 5-6 (revise): Mediocre. Has structural problems like missing key topics,
-  significantly under the word target, or reads like a bullet-point outline
-  instead of prose. Requires specific fixes.
-- Score 0-4 (fail): Terrible. Off-topic, incoherent, or so short it's unusable.
-  Needs full regeneration.
+  the {word_target}-word target (within 20%). Minor suggestions only.
+  THIS IS THE EXPECTED RANGE for a competent draft.
+- Score 5-6 (revise): Has structural problems: missing key topics, OR more than
+  20% below the {word_target}-word target, OR reads like a bullet-point outline.
+  Requires specific fixes.
+- Score 0-4 (fail): Off-topic, incoherent, or below 50% of the {word_target}-word
+  target. Needs full regeneration.
 
 DECISION RULES:
 - pass (score 7-10): Chapter is ready. Put minor polish suggestions in
@@ -42,14 +46,16 @@ DECISION RULES:
   OBJECTIVE issues, not stylistic preferences.
 - fail (score 0-4): Chapter misses the goal entirely. Needs full regeneration.
 
+{review_policy}
+
 Return ONLY valid JSON. Do not return Markdown, code fences, comments, or a
 tool/function call. Every list field must be a JSON array of strings.
 
 Required JSON shape:
 {{
   "chapter_number": {chapter_number},
-  "decision": "pass",
-  "score": 8,
+  "decision": "<pass|revise|fail>",
+  "score": "<integer 0-10>",
   "problems": [],
   "required_fixes": [],
   "suggested_edits": [],
@@ -80,7 +86,7 @@ REVIEWER_USER_PROMPT = """Review this chapter draft:
 {continuity_context}
 
 Return only the ReviewDecision JSON. Be fair - if the chapter covers its topic
-with reasonable prose and approximately meets the word target, score it 7+.
+with reasonable prose and approximately meets the word target, pass it.
 """
 
 LIST_FIELDS = (
@@ -130,6 +136,8 @@ def run_reviewer(
             "Only request another revision for remaining serious problems."
         )
 
+    review_policy = _build_review_policy()
+
     system_msg = REVIEWER_SYSTEM_PROMPT.format(
         title=book_bible.working_title,
         thesis=book_bible.core_thesis,
@@ -141,6 +149,7 @@ def run_reviewer(
         chapter_summary=chapter_summary,
         word_target=word_target,
         revision_context=revision_context,
+        review_policy=review_policy,
     )
     user_msg = REVIEWER_USER_PROMPT.format(
         chapter_body=truncate_to_budget(draft.body, settings.context_budget.total_max // 2),
@@ -165,6 +174,7 @@ def run_reviewer(
                     ("human", user_msg),
                 ]
             )
+            record_success()
             result = _parse_review_decision(
                 _extract_message_text(response),
                 draft.chapter_number,
@@ -182,6 +192,7 @@ def run_reviewer(
             )
             return result
         except Exception as exc:
+            raise_if_rate_limited(exc)
             last_error = exc
             logger.warning(
                 "Reviewer attempt %s for chapter %s failed: %s",
@@ -212,6 +223,21 @@ def _build_review_continuity(memory: DynamicMemory) -> str:
         lines.extend(f"- {warning}" for warning in memory.repetition_warnings)
 
     return truncate_to_budget("\n".join(lines), settings.context_budget.dynamic_memory)
+
+
+def _build_review_policy() -> str:
+    if not settings.review.single_pass or settings.review.allow_reviewer_revisions:
+        return ""
+
+    return (
+        "BUDGET-CONSCIOUS SINGLE-PASS REVIEW MODE:\n"
+        f"- The reviewer should only run once per chapter.\n"
+        f"- Treat {settings.review.accept_score:.1f}+ as a clean pass.\n"
+        f"- Also return pass for any usable chapter scoring {settings.review.soft_accept_score:.1f} or higher.\n"
+        "- Put non-critical improvements in suggested_edits instead of requesting revision.\n"
+        "- Use revise only for objective, serious issues that make the chapter unsuitable.\n"
+        "- Use fail only when the chapter is off-topic, incoherent, or far below the requested scope."
+    )
 
 
 def _extract_message_text(response: object) -> str:

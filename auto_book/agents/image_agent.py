@@ -18,7 +18,11 @@ from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft
 from auto_book.models.image import ImageAnchor, ImageAsset, ImagePrompt
 from auto_book.utils.logger import get_logger
-from auto_book.utils.rate_limiter import wait_for_rate_limit
+from auto_book.utils.rate_limiter import (
+    raise_if_rate_limited,
+    record_success,
+    wait_for_rate_limit,
+)
 from auto_book.utils.tokens import truncate_to_budget
 
 KIE_CREATE_TASK_URL = "https://api.kie.ai/api/v1/jobs/createTask"
@@ -39,12 +43,18 @@ Book context:
 
 Prompt requirements:
 - Be specific and visual, not a short label.
-- Describe the visual type: infographic, diagram, worksheet, editorial
-  illustration, scene, concept map, etc.
+- This is a NON-FICTION book. Generate DIAGRAMS, INFOGRAPHICS, FLOWCHARTS,
+  COMPARISON TABLES, STEP-BY-STEP VISUALS, or CONCEPT MAPS — NOT photos,
+  portraits, landscapes, or decorative illustrations.
+- Describe the visual type explicitly: e.g. "a clean 4-step flowchart showing...",
+  "a two-column comparison table contrasting X and Y", "a circular diagram with
+  5 labeled segments representing...".
 - Describe composition, main objects, layout, labels/text that should appear,
-  style, color direction, mood, and what to avoid.
-- Prefer readable diagrams and concept illustrations for non-fiction.
-- Avoid tiny unreadable text, brand logos, copyrighted characters, and clutter.
+  style, color direction, and what to avoid.
+- Use a flat, modern infographic style: white or light background, bold sans-serif
+  labels, 2-3 accent colors, clear visual hierarchy, generous whitespace.
+- Avoid: photos of people, stock-photo aesthetics, tiny unreadable text, brand
+  logos, copyrighted characters, decorative borders, and visual clutter.
 - Return ONLY valid JSON, with no Markdown or code fences.
 
 Required JSON shape:
@@ -103,6 +113,23 @@ def run_image_agent(
         _save_json(images_dir / "image_plan.json", [])
         _save_json(images_dir / "image_assets.json", [])
         return []
+
+    if not settings.images.generate_actual:
+        assets = [
+            ImageAsset(
+                anchor_id=anchor.anchor_id,
+                chapter_number=anchor.chapter_number,
+                position=anchor.marker,
+                prompt_used=f"Placeholder for {anchor.anchor_id}",
+                alt_text=anchor.anchor_id.replace("_", " ").title(),
+                is_placeholder=True,
+            )
+            for anchor in anchors
+        ]
+        _save_json(images_dir / "image_plan.json", [])
+        _save_json(images_dir / "image_assets.json", [asset.model_dump() for asset in assets])
+        logger.info("Image Agent: generate_actual=false, returning %s placeholder(s)", len(assets))
+        return assets
 
     chapter_by_number = {chapter.chapter_number: chapter for chapter in ordered}
     prompts: list[ImagePrompt] = []
@@ -202,6 +229,7 @@ def plan_image_for_anchor(
                 ("human", user_msg),
             ]
         )
+        record_success()
         payload = _load_json_object(_strip_code_fence(_extract_message_text(response)))
         payload["anchor_id"] = anchor.anchor_id
         payload["chapter_number"] = anchor.chapter_number
@@ -212,6 +240,7 @@ def plan_image_for_anchor(
         logger.info("Image prompt created for %s", anchor.anchor_id)
         return prompt
     except Exception as exc:
+        raise_if_rate_limited(exc)
         logger.warning(
             "Image prompt expansion failed for %s: %s. Using fallback prompt.",
             anchor.anchor_id,
@@ -259,6 +288,30 @@ def generate_image_via_kie(prompt: ImagePrompt, output_dir: str) -> ImageAsset:
         if settings.images.fallback_to_placeholder:
             return _placeholder_asset(prompt, str(exc))
         raise
+
+
+def generate_cover_image(book_bible: BookBible, output_dir: str) -> ImageAsset:
+    """Generate a cover image for the book title page."""
+
+    cover_prompt = (
+        f"A professional book cover background for a non-fiction book titled "
+        f'"{book_bible.working_title}". '
+        f"Genre: {book_bible.genre}. "
+        f"Style: modern, clean, editorial. "
+        f"Use abstract geometric shapes, subtle gradients, and a dark navy or deep teal "
+        f"color palette. No text, no people, no photos. "
+        f"The image should work as a full-page background behind white title text. "
+        f"Flat design, high contrast, professional publishing aesthetic."
+    )
+    prompt = ImagePrompt(
+        anchor_id="COVER",
+        chapter_number=0,
+        position="cover",
+        prompt=cover_prompt,
+        style="modern editorial book cover, abstract geometric",
+        alt_text=f"Cover image for {book_bible.working_title}",
+    )
+    return generate_image_via_kie(prompt, output_dir)
 
 
 def _create_kie_task(client: httpx.Client, prompt: ImagePrompt) -> str:

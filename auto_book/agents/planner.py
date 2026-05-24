@@ -6,7 +6,11 @@ from auto_book.agents.llm_client import get_llm
 from auto_book.config import settings
 from auto_book.models.book_bible import BookBible
 from auto_book.utils.logger import get_logger
-from auto_book.utils.rate_limiter import wait_for_rate_limit
+from auto_book.utils.rate_limiter import (
+    raise_if_rate_limited,
+    record_success,
+    wait_for_rate_limit,
+)
 from auto_book.utils.tokens import count_tokens
 
 PLANNER_SYSTEM_PROMPT = """You are an expert book planner and publishing strategist.
@@ -87,8 +91,13 @@ def run_planner(user_brief: str, genre: str) -> BookBible:
                     ("human", user_msg),
                 ]
             )
+            record_success()
             if not isinstance(result, BookBible):
                 result = BookBible.model_validate(result)
+
+            # LLMs often ignore word_count_target in structured output — enforce it
+            for chapter in result.chapter_outline:
+                chapter.word_count_target = settings.book.target_words_per_chapter
 
             errors = _validate_book_bible(result)
             if errors:
@@ -101,6 +110,7 @@ def run_planner(user_brief: str, genre: str) -> BookBible:
             )
             return result
         except Exception as exc:
+            raise_if_rate_limited(exc)
             last_error = exc
             logger.warning("Planner attempt %s failed: %s", attempt, exc)
             if attempt < settings.retry.max_validation_retries:

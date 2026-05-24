@@ -1,4 +1,4 @@
-# Cheap Phase 3 smoke-test configuration.
+# Medium run configuration - 6 chapters, ~1000 words each (~35k tokens total)
 
 llm:
   provider: "groq"
@@ -12,11 +12,11 @@ llm:
   temperature_memory: 0.1
 
 book:
-  default_chapter_count: 3
-  target_words_per_chapter: 500
-  min_words_per_chapter: 250
-  max_words_per_chapter: 600
-  target_total_pages: 6
+  default_chapter_count: 6
+  target_words_per_chapter: 1000
+  min_words_per_chapter: 700
+  max_words_per_chapter: 1100
+  target_total_pages: 18
 
 retry:
   max_revisions: 3
@@ -28,37 +28,37 @@ review:
   enabled: true
   max_review_passes: 1
   single_pass: true
-  accept_score: 6.0
+  accept_score: 7.0
   soft_accept_score: 5.0
   allow_reviewer_revisions: false
 
 context_budget:
   system_prompt: 500
-  book_bible: 1200
-  dynamic_memory: 1200
-  research_notes: 0
+  book_bible: 1500
+  dynamic_memory: 1500
+  research_notes: 1000
   chapter_plan: 500
-  generation_headroom: 2000
-  total_max: 6000
+  generation_headroom: 3000
+  total_max: 8000
 
 output:
-  directory: "./output/phase3_smoke"
+  directory: "./output/medium_run"
   save_intermediate: true
 
 images:
   enabled: true
-  generate_actual: false
-  max_images_per_chapter: 1
+  generate_actual: true
+  max_images_per_chapter: 4
   default_model: "qwen2/text-to-image"
   default_size: "16:9"
   output_format: "png"
   timeout_seconds: 120
   poll_interval_seconds: 3
-  max_poll_attempts: 20
+  max_poll_attempts: 40
   fallback_to_placeholder: true
   call_back_url: ""
 
 logging:
   level: "INFO"
   log_to_file: true
-  log_file: "./output/phase3_smoke/run.log"
+  log_file: "./output/medium_run/run.log"

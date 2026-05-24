@@ -10,6 +10,7 @@ from auto_book.models.image import ImageAsset
 from auto_book.models.memory import DynamicMemory
 from auto_book.models.run_state import ChapterStatus, RunPhase, RunState, TokenUsage
 from auto_book.utils.logger import get_logger
+from auto_book.utils.rate_limiter import is_rate_limit_error
 
 CHECKPOINT_FILENAME = "run_state.json"
 
@@ -72,14 +73,28 @@ def graph_state_to_run_state(state: dict[str, Any]) -> RunState:
         chapter_statuses=chapter_statuses,
         token_usage=token_usage,
         image_assets=image_assets,
+        cover_asset=_coerce_model(state.get("cover_asset"), ImageAsset),
         export_result=export_result,
         failure_reason=str(state.get("error") or ""),
+        retry_after_seconds=int(state.get("retry_after_seconds") or 0),
+        resume_not_before=state.get("resume_not_before"),
         output_directory=str(state.get("output_directory") or "./output"),
     )
 
 
 def run_state_to_graph_state(run_state: RunState) -> dict[str, Any]:
     """Convert a RunState checkpoint into the graph's initial state shape."""
+
+    phase = run_state.phase
+    error = run_state.failure_reason
+    current_chapter = run_state.current_chapter
+
+    if phase == RunPhase.RATE_LIMITED or (
+        phase == RunPhase.FAILED and is_rate_limit_error(error)
+    ):
+        current_chapter = _rewind_to_first_unaccepted_chapter(run_state)
+        phase = RunPhase.INITIALIZED
+        error = ""
 
     return {
         "run_id": run_state.run_id,
@@ -89,20 +104,44 @@ def run_state_to_graph_state(run_state: RunState) -> dict[str, Any]:
         "genre": run_state.genre,
         "output_directory": run_state.output_directory,
         "book_bible": run_state.book_bible,
-        "current_chapter": run_state.current_chapter,
+        "current_chapter": current_chapter,
         "chapter_plan": None,
         "chapter_draft": None,
         "review_decision": None,
         "revision_count": 0,
         "regeneration_count": 0,
+        "review_passes": 0,
         "dynamic_memory": run_state.dynamic_memory,
         "chapter_statuses": run_state.chapter_statuses,
-        "phase": run_state.phase,
+        "phase": phase,
         "token_usage": run_state.token_usage,
         "image_assets": run_state.image_assets,
+        "cover_asset": run_state.cover_asset,
         "export_result": run_state.export_result,
-        "error": run_state.failure_reason,
+        "retry_after_seconds": run_state.retry_after_seconds,
+        "resume_not_before": run_state.resume_not_before,
+        "error": error,
     }
+
+
+def _rewind_to_first_unaccepted_chapter(run_state: RunState) -> int:
+    """Return the graph counter value that will prepare the first pending chapter."""
+
+    for status in sorted(run_state.chapter_statuses, key=lambda item: item.chapter_number):
+        if status.accepted_draft is None:
+            return max(0, status.chapter_number - 1)
+
+    if run_state.book_bible is not None:
+        accepted = {
+            status.chapter_number
+            for status in run_state.chapter_statuses
+            if status.accepted_draft is not None
+        }
+        for chapter in run_state.book_bible.chapter_outline:
+            if chapter.chapter_number not in accepted:
+                return max(0, chapter.chapter_number - 1)
+
+    return run_state.current_chapter
 
 
 def save_checkpoint(state: RunState, output_dir: str) -> None:

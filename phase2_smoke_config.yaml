@@ -15,14 +15,22 @@ book:
   default_chapter_count: 3
   target_words_per_chapter: 500
   min_words_per_chapter: 250
-  max_words_per_chapter: 900
+  max_words_per_chapter: 600
   target_total_pages: 6
 
 retry:
   max_revisions: 3
   max_regenerations: 1
-  max_validation_retries: 2
+  max_validation_retries: 3
   retry_delay_seconds: 6
+
+review:
+  enabled: true
+  max_review_passes: 1
+  single_pass: true
+  accept_score: 6.0
+  soft_accept_score: 5.0
+  allow_reviewer_revisions: false
 
 context_budget:
   system_prompt: 500

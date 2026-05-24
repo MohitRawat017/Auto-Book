@@ -51,6 +51,15 @@ class RetrySettings(BaseModel):
     retry_delay_seconds: int = 6
 
 
+class ReviewSettings(BaseModel):
+    enabled: bool = True
+    max_review_passes: int = 1
+    single_pass: bool = True
+    accept_score: float = 7.0
+    soft_accept_score: float = 6.0
+    allow_reviewer_revisions: bool = False
+
+
 class ContextBudget(BaseModel):
     system_prompt: int = 500
     book_bible: int = 1500
@@ -92,6 +101,7 @@ class Settings(BaseModel):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     book: BookSettings = Field(default_factory=BookSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
+    review: ReviewSettings = Field(default_factory=ReviewSettings)
     context_budget: ContextBudget = Field(default_factory=ContextBudget)
     output: OutputSettings = Field(default_factory=OutputSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)

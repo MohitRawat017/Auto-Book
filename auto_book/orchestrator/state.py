@@ -28,10 +28,14 @@ class GraphState(TypedDict, total=False):
     review_decision: ReviewDecision | None
     revision_count: int
     regeneration_count: int
+    review_passes: int
     dynamic_memory: DynamicMemory
     chapter_statuses: list[ChapterStatus]
     phase: RunPhase
     token_usage: TokenUsage
     image_assets: list[ImageAsset]
+    cover_asset: ImageAsset | None
     export_result: ExportResult | None
+    retry_after_seconds: int
+    resume_not_before: datetime | None
     error: str

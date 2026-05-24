@@ -23,6 +23,7 @@ class RunPhase(str, Enum):
     IMAGE_GENERATION = "image_generation"
     ASSEMBLING = "assembling"
     EXPORTING = "exporting"
+    RATE_LIMITED = "rate_limited"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -34,6 +35,7 @@ class ChapterStatus(BaseModel):
     status: str = "pending"
     revision_count: int = 0
     regeneration_count: int = 0
+    review_passes: int = 0
     current_draft: ChapterDraft | None = None
     last_review: ReviewDecision | None = None
     accepted_draft: ChapterDraft | None = None
@@ -62,6 +64,9 @@ class RunState(BaseModel):
     chapter_statuses: list[ChapterStatus] = Field(default_factory=list)
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     image_assets: list[ImageAsset] = Field(default_factory=list)
+    cover_asset: ImageAsset | None = None
     export_result: ExportResult | None = None
     failure_reason: str = ""
+    retry_after_seconds: int = 0
+    resume_not_before: datetime | None = None
     output_directory: str = "./output"

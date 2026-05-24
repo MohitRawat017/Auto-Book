@@ -24,6 +24,14 @@ retry:
   max_validation_retries: 3
   retry_delay_seconds: 6
 
+review:
+  enabled: true
+  max_review_passes: 1
+  single_pass: true
+  accept_score: 7.0
+  soft_accept_score: 6.0
+  allow_reviewer_revisions: false
+
 context_budget:
   system_prompt: 500
   book_bible: 1500
@@ -40,7 +48,7 @@ output:
 images:
   enabled: true
   generate_actual: true
-  max_images_per_chapter: 3
+  max_images_per_chapter: 4
   default_model: "qwen2/text-to-image"
   default_size: "16:9"
   output_format: "png"

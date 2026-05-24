@@ -7,7 +7,11 @@ from auto_book.config import settings
 from auto_book.models.chapter import ChapterDraft
 from auto_book.models.memory import ChapterMemoryEntry, DynamicMemory
 from auto_book.utils.logger import get_logger
-from auto_book.utils.rate_limiter import wait_for_rate_limit
+from auto_book.utils.rate_limiter import (
+    raise_if_rate_limited,
+    record_success,
+    wait_for_rate_limit,
+)
 from auto_book.utils.tokens import count_tokens, truncate_to_budget
 
 MEMORY_SYSTEM_PROMPT = """You are a meticulous editorial assistant.
@@ -63,6 +67,7 @@ def run_memory_update(
                     ("human", user_msg),
                 ]
             )
+            record_success()
             if not isinstance(entry, ChapterMemoryEntry):
                 entry = ChapterMemoryEntry.model_validate(entry)
 
@@ -76,6 +81,7 @@ def run_memory_update(
             )
             return updated
         except Exception as exc:
+            raise_if_rate_limited(exc)
             last_error = exc
             logger.warning(
                 "Memory update attempt %s for chapter %s failed: %s",

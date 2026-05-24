@@ -5,6 +5,8 @@ import re
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from auto_book.models.book_bible import BookBible
@@ -14,6 +16,9 @@ from auto_book.models.image import ImageAsset
 from auto_book.utils.logger import get_logger
 
 IMAGE_ANCHOR_PATTERN = re.compile(r"^\[IMAGE_ANCHOR:\s*([A-Z0-9_]+)\]\s*$")
+
+_DARK_BLUE = RGBColor(31, 56, 100)
+_GREY = RGBColor(128, 128, 128)
 
 
 def assemble_markdown(
@@ -83,6 +88,7 @@ def assemble_docx(
     chapters: list[ChapterDraft],
     output_dir: str,
     image_assets: list[ImageAsset] | None = None,
+    cover_asset: ImageAsset | None = None,
 ) -> str:
     """Assemble accepted chapters and available images into output/book.docx."""
 
@@ -92,39 +98,88 @@ def assemble_docx(
 
     ordered = sorted(chapters, key=lambda chapter: chapter.chapter_number)
     images = image_assets or []
+
+    template = Path("resources/template.docx")
+    has_template = False
     doc = Document()
+    if template.exists():
+        try:
+            t = Document(str(template))
+            from collections import Counter
+            dupes = [n for n, c in Counter(s.name for s in t.styles).items() if c > 1]
+            if dupes:
+                get_logger().warning(
+                    "Template has duplicate styles %s — fix in Word and re-save. Using blank document.",
+                    dupes,
+                )
+            else:
+                doc = t
+                has_template = True
+        except Exception as exc:
+            get_logger().warning("Template load failed (%s); using blank document.", exc)
 
-    _add_title_page(doc, book_bible)
-    doc.add_page_break()
-    doc.add_heading("Table of Contents", level=1)
-    for chapter in ordered:
-        doc.add_paragraph(
-            f"Chapter {chapter.chapter_number}: {chapter.title}",
-            style="List Number",
-        )
-
-    for chapter in ordered:
-        doc.add_page_break()
-        _add_chapter(doc, chapter, images)
-
+    _build_docx(doc, book_bible, ordered, images, has_template, cover_asset)
     doc.save(str(output_path))
     logger.info("DOCX assembled at %s", output_path)
     return str(output_path)
 
 
-def _add_title_page(doc: Document, bible: BookBible) -> None:
-    for _ in range(6):
-        doc.add_paragraph("")
+def _build_docx(
+    doc: Document,
+    book_bible: BookBible,
+    ordered: list[ChapterDraft],
+    images: list[ImageAsset],
+    has_template: bool,
+    cover_asset: ImageAsset | None = None,
+) -> None:
+    _add_title_page(doc, book_bible, has_template, cover_asset)
+    doc.add_page_break()
+    _add_toc(doc, chapters=ordered, has_template=has_template)
+    _add_header_footer(doc, book_bible)
+    for chapter in ordered:
+        doc.add_page_break()
+        _add_chapter(doc, chapter, images, has_template)
 
-    title = doc.add_heading(bible.working_title, level=0)
+
+def _add_title_page(
+    doc: Document,
+    bible: BookBible,
+    has_template: bool = False,
+    cover_asset: ImageAsset | None = None,
+) -> None:
+    # Cover image — full page width if available
+    if cover_asset and cover_asset.file_path and Path(cover_asset.file_path).exists():
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run()
+        run.add_picture(cover_asset.file_path, width=Inches(6.5))
+        doc.add_paragraph("")
+    else:
+        for _ in range(5):
+            doc.add_paragraph("")
+
+    # Title
+    if has_template:
+        title = doc.add_paragraph(bible.working_title, style="Title")
+    else:
+        title = doc.add_heading(bible.working_title, level=0)
+        for run in title.runs:
+            run.font.size = Pt(28)
+            run.font.bold = True
+            run.font.color.rgb = _DARK_BLUE
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    # Subtitle
     if bible.subtitle:
-        subtitle = doc.add_paragraph(bible.subtitle)
+        if has_template:
+            subtitle = doc.add_paragraph(bible.subtitle, style="Subtitle")
+        else:
+            subtitle = doc.add_paragraph(bible.subtitle)
+            for run in subtitle.runs:
+                run.font.size = Pt(16)
+                run.font.italic = True
+                run.font.color.rgb = RGBColor(100, 100, 100)
         subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        for run in subtitle.runs:
-            run.font.size = Pt(16)
-            run.font.color.rgb = RGBColor(100, 100, 100)
 
     doc.add_paragraph("")
     tagline = doc.add_paragraph(bible.book_promise)
@@ -132,48 +187,178 @@ def _add_title_page(doc: Document, bible: BookBible) -> None:
     for run in tagline.runs:
         run.font.italic = True
         run.font.size = Pt(12)
+        if not has_template:
+            run.font.color.rgb = RGBColor(80, 80, 80)
+
+
+def _add_toc(doc: Document, chapters: list | None = None, has_template: bool = False) -> None:
+    """Add a static Table of Contents with chapter titles and section subheadings."""
+    if has_template:
+        try:
+            doc.add_paragraph("Table of Contents", style="TOC Heading")
+        except Exception:
+            doc.add_heading("Table of Contents", level=1)
+    else:
+        h = doc.add_heading("Table of Contents", level=1)
+        h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in h.runs:
+            run.font.size = Pt(20)
+            run.font.color.rgb = _DARK_BLUE
+
+    if not chapters:
+        return
+
+    for chapter in chapters:
+        # Chapter entry (toc 1)
+        try:
+            p = doc.add_paragraph(style="toc 1" if has_template else "Normal")
+        except Exception:
+            p = doc.add_paragraph()
+        run = p.add_run(f"Chapter {chapter.chapter_number}: {chapter.title}")
+        run.font.bold = True
+        if not has_template:
+            run.font.size = Pt(11)
+            run.font.color.rgb = _DARK_BLUE
+        dots = p.add_run("  " + "." * 35)
+        dots.font.size = Pt(9)
+        dots.font.color.rgb = _GREY
+        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.space_before = Pt(6)
+
+        # Section subheadings (toc 2) — extract ## lines from chapter body
+        for line in chapter.body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                section_title = stripped[3:].strip()
+                try:
+                    sp = doc.add_paragraph(style="toc 2" if has_template else "Normal")
+                except Exception:
+                    sp = doc.add_paragraph()
+                sr = sp.add_run(f"    {section_title}")
+                if not has_template:
+                    sr.font.size = Pt(10)
+                    sr.font.color.rgb = _GREY
+                sp.paragraph_format.space_after = Pt(1)
+                sp.paragraph_format.left_indent = Pt(18)
+
+
+def _add_header_footer(doc: Document, bible: BookBible) -> None:
+    """Add book title in header and page number in footer across all sections."""
+    for section in doc.sections:
+        section.different_first_page_header_footer = True
+
+        header = section.header
+        if not header.paragraphs:
+            header.add_paragraph()
+        hp = header.paragraphs[0]
+        hp.clear()
+        run = hp.add_run(bible.working_title)
+        run.font.size = Pt(9)
+        run.font.color.rgb = _GREY
+        hp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        footer = section.footer
+        if not footer.paragraphs:
+            footer.add_paragraph()
+        fp = footer.paragraphs[0]
+        fp.clear()
+        _add_page_number_field(fp)
+
+
+def _add_page_number_field(paragraph) -> None:
+    """Inject a Word PAGE field into a paragraph."""
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for tag, field_text in [("begin", None), (None, " PAGE "), ("end", None)]:
+        run = paragraph.add_run()
+        if tag:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), tag)
+            run._r.append(el)
+        else:
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = field_text
+            run._r.append(el)
+        run.font.size = Pt(9)
+        run.font.color.rgb = _GREY
 
 
 def _add_chapter(
     doc: Document,
     chapter: ChapterDraft,
     image_assets: list[ImageAsset],
+    has_template: bool = False,
 ) -> None:
-    doc.add_heading(f"Chapter {chapter.chapter_number}: {chapter.title}", level=1)
-    _add_markdown_body(doc, _strip_duplicate_title(chapter), image_assets)
+    heading = doc.add_heading(f"Chapter {chapter.chapter_number}: {chapter.title}", level=1)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in heading.runs:
+        run.font.size = Pt(22)
+        run.font.bold = True
+        if not has_template:
+            run.font.color.rgb = _DARK_BLUE
+    heading.paragraph_format.space_before = Pt(12)
+    heading.paragraph_format.space_after = Pt(16)
+
+    _add_markdown_body(doc, _strip_duplicate_title(chapter), image_assets, has_template)
 
     if chapter.key_takeaways:
         doc.add_heading("Key Takeaways", level=3)
         for takeaway in chapter.key_takeaways:
-            doc.add_paragraph(takeaway, style="List Bullet")
+            p = doc.add_paragraph(takeaway, style="List Bullet")
+            if not has_template:
+                p.paragraph_format.space_after = Pt(3)
 
 
 def _add_markdown_body(
     doc: Document,
     markdown: str,
     image_assets: list[ImageAsset],
+    has_template: bool = False,
 ) -> None:
     for raw_line in markdown.splitlines():
         line = raw_line.strip()
+
+        # Blank line = paragraph break spacer
         if not line:
+            if not has_template:
+                spacer = doc.add_paragraph()
+                spacer.paragraph_format.space_after = Pt(4)
             continue
 
         anchor_match = IMAGE_ANCHOR_PATTERN.fullmatch(line)
         if anchor_match:
             _add_docx_anchor_image(doc, anchor_match.group(1), image_assets)
         elif line.startswith("### "):
-            doc.add_heading(line[4:], level=3)
+            h = doc.add_heading(line[4:], level=3)
+            if not has_template:
+                h.paragraph_format.space_before = Pt(10)
         elif line.startswith("## "):
-            doc.add_heading(line[3:], level=2)
+            h = doc.add_heading(line[3:], level=2)
+            if not has_template:
+                for run in h.runs:
+                    run.font.size = Pt(14)
+                    run.font.bold = True
+                h.paragraph_format.space_before = Pt(14)
+                h.paragraph_format.space_after = Pt(4)
         elif line.startswith("# "):
             doc.add_heading(line[2:], level=1)
         elif line.startswith("- ") or line.startswith("* "):
-            doc.add_paragraph(line[2:], style="List Bullet")
+            p = doc.add_paragraph(line[2:], style="List Bullet")
+            if not has_template:
+                p.paragraph_format.space_after = Pt(3)
         elif re.match(r"^\d+[\.)]\s+", line):
-            doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", line), style="List Number")
+            p = doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", line), style="List Number")
+            if not has_template:
+                p.paragraph_format.space_after = Pt(3)
         else:
             paragraph = doc.add_paragraph()
             _add_formatted_text(paragraph, line)
+            if not has_template:
+                paragraph.paragraph_format.first_line_indent = Pt(18)
+                paragraph.paragraph_format.space_after = Pt(10)
+                paragraph.paragraph_format.line_spacing = 1.15
+                for run in paragraph.runs:
+                    run.font.size = Pt(11)
 
 
 def _add_formatted_text(paragraph, text: str) -> None:
@@ -203,7 +388,6 @@ def _replace_markdown_anchors(
         if not match:
             lines.append(raw_line)
             continue
-
         lines.append(_markdown_for_anchor(match.group(1), image_assets, markdown_dir))
     return "\n".join(lines).strip()
 
@@ -216,10 +400,10 @@ def _markdown_for_anchor(
     image = _image_for_anchor(anchor_id, image_assets)
     if image is None or image.is_placeholder or not image.file_path:
         label = (
-            image.alt_text if image else ""
-        ) or (
-            image.prompt_used if image else ""
-        ) or anchor_id.replace("_", " ").title()
+            (image.alt_text if image else "")
+            or (image.prompt_used if image else "")
+            or anchor_id.replace("_", " ").title()
+        )
         return f"*[Image placeholder: {label}]*"
 
     image_path = Path(image.file_path)
@@ -239,10 +423,10 @@ def _add_docx_anchor_image(
     image = _image_for_anchor(anchor_id, image_assets)
     if image is None or image.is_placeholder or not image.file_path:
         label = (
-            image.alt_text if image else ""
-        ) or (
-            image.prompt_used if image else ""
-        ) or anchor_id.replace("_", " ").title()
+            (image.alt_text if image else "")
+            or (image.prompt_used if image else "")
+            or anchor_id.replace("_", " ").title()
+        )
         paragraph = doc.add_paragraph()
         run = paragraph.add_run(f"[Image placeholder: {label}]")
         run.italic = True
@@ -255,14 +439,22 @@ def _add_docx_anchor_image(
         run.italic = True
         return
 
-    doc.add_paragraph("")
-    doc.add_picture(str(image_path), width=Inches(5.5))
+    # Full-width image centered
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(8)
+    run = p.add_run()
+    run.add_picture(str(image_path), width=Inches(5.5))
+
+    # Caption
     if image.alt_text:
         caption = doc.add_paragraph(image.alt_text)
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        caption.paragraph_format.space_after = Pt(10)
         for run in caption.runs:
             run.font.italic = True
             run.font.size = Pt(9)
+            run.font.color.rgb = _GREY
 
 
 def _image_for_anchor(

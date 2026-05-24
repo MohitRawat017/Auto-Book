@@ -1,6 +1,7 @@
 """LangGraph state machine for the Phase 2 core writing loop."""
 
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from typing import Any
 
 from langgraph.graph import END, StateGraph
@@ -25,14 +26,19 @@ from auto_book.utils.artifacts import (
     save_dynamic_memory,
     save_review,
 )
+from auto_book.utils.image_queue import image_queue
 from auto_book.utils.logger import get_logger
+from auto_book.utils.rate_limiter import RateLimitPause
 
 
 def _checkpointing_node(node: Callable[[GraphState], dict[str, Any]]):
     """Wrap a node so each completed step is checkpointed."""
 
     def wrapped(state: GraphState) -> dict[str, Any]:
-        update = node(state)
+        try:
+            update = node(state)
+        except RateLimitPause as exc:
+            update = _rate_limit_update(exc)
         merged = dict(state)
         merged.update(update)
         save_graph_checkpoint(merged)
@@ -40,6 +46,26 @@ def _checkpointing_node(node: Callable[[GraphState], dict[str, Any]]):
 
     wrapped.__name__ = node.__name__
     return wrapped
+
+
+def _rate_limit_update(exc: RateLimitPause) -> dict[str, Any]:
+    """Return a checkpointable graph update for provider rate limits."""
+
+    wait_seconds = max(0, exc.retry_after_seconds)
+    resume_not_before = (
+        datetime.now() + timedelta(seconds=wait_seconds) if wait_seconds else None
+    )
+    get_logger().warning(
+        "Run paused by %s rate limit; retry after %s seconds",
+        exc.provider,
+        wait_seconds,
+    )
+    return {
+        "phase": RunPhase.RATE_LIMITED,
+        "error": str(exc),
+        "retry_after_seconds": wait_seconds,
+        "resume_not_before": resume_not_before,
+    }
 
 
 def _update_chapter_status(
@@ -75,10 +101,14 @@ def collect_input(state: GraphState) -> dict[str, Any]:
         return {"phase": RunPhase.FAILED, "error": "User brief is required."}
 
     logger.info("Collecting input for brief: %s", brief[:100])
+    image_queue.reset()
     return {
         "user_brief": brief,
         "genre": state.get("genre") or "non-fiction how-to",
         "phase": RunPhase.INITIALIZED,
+        "retry_after_seconds": 0,
+        "resume_not_before": None,
+        "error": "",
     }
 
 
@@ -105,12 +135,15 @@ def plan_book(state: GraphState) -> dict[str, Any]:
             for chapter in bible.chapter_outline
         ]
         logger.info("Planning complete: %s", bible.working_title)
+        image_queue.submit_cover(bible, output_dir)
         return {
             "book_bible": bible,
             "chapter_statuses": chapter_statuses,
             "current_chapter": 0,
             "phase": RunPhase.PLANNING,
         }
+    except RateLimitPause as exc:
+        return _rate_limit_update(exc)
     except Exception as exc:
         logger.error("Planning failed: %s", exc)
         return {"phase": RunPhase.FAILED, "error": str(exc)}
@@ -140,6 +173,20 @@ def prepare_chapter(state: GraphState) -> dict[str, Any]:
             "chapter(s) accepted so far."
         ),
     )
+
+    existing_status = next(
+        (
+            status
+            for status in state.get("chapter_statuses", [])
+            if status.chapter_number == current
+        ),
+        None,
+    )
+    if existing_status and existing_status.accepted_draft is None:
+        resume_update = _resume_pending_chapter(current, chapter_plan, existing_status)
+        if resume_update is not None:
+            return resume_update
+
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         current,
@@ -157,8 +204,48 @@ def prepare_chapter(state: GraphState) -> dict[str, Any]:
         "review_decision": None,
         "revision_count": 0,
         "regeneration_count": 0,
+        "review_passes": 0,
         "chapter_statuses": statuses,
         "phase": RunPhase.WRITING,
+    }
+
+
+def _resume_pending_chapter(
+    chapter_number: int,
+    chapter_plan: ChapterPlan,
+    status: ChapterStatus,
+) -> dict[str, Any] | None:
+    """Resume an unaccepted chapter from its saved draft/review if available."""
+
+    draft = status.current_draft
+    if draft is None:
+        return None
+
+    review = status.last_review
+    phase = RunPhase.REVIEWING
+    status_label = "drafted"
+    if review is not None:
+        if review.decision == ReviewDecisionEnum.PASS:
+            phase = RunPhase.MEMORY_UPDATE
+            status_label = "reviewed"
+        else:
+            phase = RunPhase.WRITING
+            status_label = "reviewed"
+
+    get_logger().info(
+        "Resuming chapter %s from saved %s state",
+        chapter_number,
+        status_label,
+    )
+    return {
+        "current_chapter": chapter_number,
+        "chapter_plan": chapter_plan,
+        "chapter_draft": draft,
+        "review_decision": review,
+        "revision_count": status.revision_count,
+        "regeneration_count": status.regeneration_count,
+        "review_passes": status.review_passes,
+        "phase": phase,
     }
 
 
@@ -196,6 +283,8 @@ def write_chapter(state: GraphState) -> dict[str, Any]:
             previous_draft=previous_draft,
             revision_number=revision_count,
         )
+    except RateLimitPause as exc:
+        return _rate_limit_update(exc)
     except Exception as exc:
         logger.error("Writing failed for chapter %s: %s", chapter_plan.chapter_number, exc)
         return {"phase": RunPhase.FAILED, "error": str(exc)}
@@ -241,24 +330,31 @@ def review_chapter(state: GraphState) -> dict[str, Any]:
             state.get("dynamic_memory", DynamicMemory()),
             revision_count=revision_count,
         )
+    except RateLimitPause as exc:
+        return _rate_limit_update(exc)
     except Exception as exc:
         logger.error("Review failed for chapter %s: %s", draft.chapter_number, exc)
         return {"phase": RunPhase.FAILED, "error": str(exc)}
 
     save_review(review, state.get("output_directory", settings.output.directory))
+    review_passes = int(state.get("review_passes") or 0) + 1
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         draft.chapter_number,
         status="reviewed",
         last_review=review,
+        review_passes=review_passes,
     )
     logger.info(
-        "Review complete for chapter %s: %s",
+        "Review complete for chapter %s: %s (pass %s/%s)",
         draft.chapter_number,
         review.decision.value,
+        review_passes,
+        settings.review.max_review_passes,
     )
     return {
         "review_decision": review,
+        "review_passes": review_passes,
         "chapter_statuses": statuses,
         "phase": RunPhase.REVIEWING,
     }
@@ -274,6 +370,8 @@ def update_memory(state: GraphState) -> dict[str, Any]:
 
     try:
         memory = run_memory_update(draft, state.get("dynamic_memory", DynamicMemory()))
+    except RateLimitPause as exc:
+        return _rate_limit_update(exc)
     except Exception as exc:
         logger.error("Memory update failed for chapter %s: %s", draft.chapter_number, exc)
         return {"phase": RunPhase.FAILED, "error": str(exc)}
@@ -295,6 +393,14 @@ def update_memory(state: GraphState) -> dict[str, Any]:
         current_draft=draft,
     )
     logger.info("Chapter %s accepted and memory updated", draft.chapter_number)
+
+    # Submit image generation for this chapter's anchors in background
+    if state.get("book_bible") is not None:
+        from auto_book.agents.image_agent import extract_image_anchors
+        anchors = extract_image_anchors([draft])
+        for anchor in anchors:
+            image_queue.submit_chapter(anchor, draft, state["book_bible"], output_dir)
+
     return {
         "dynamic_memory": memory,
         "chapter_statuses": statuses,
@@ -313,7 +419,7 @@ def check_next(state: GraphState) -> dict[str, Any]:
 
 
 def assemble_book(state: GraphState) -> dict[str, Any]:
-    """Run the Image Agent for accepted chapters before export."""
+    """Collect background image jobs then hand off to export."""
 
     logger = get_logger()
     bible = state.get("book_bible")
@@ -328,19 +434,55 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
     if not accepted:
         return {"phase": RunPhase.FAILED, "error": "No accepted chapters for image planning."}
 
-    try:
-        image_assets = run_image_agent(
-            accepted,
-            bible,
-            state.get("output_directory", settings.output.directory),
-        )
-    except Exception as exc:
-        logger.warning("Image Agent failed; proceeding without images: %s", exc)
-        image_assets = []
+    output_dir = state.get("output_directory", settings.output.directory)
 
-    logger.info("Image planning/generation complete")
+    try:
+        # Collect background-generated images (blocks until all threads finish)
+        chapter_assets, cover_asset = image_queue.collect(timeout=600)
+
+        # Merge with any already-existing assets saved to disk (resume safety)
+        import json
+        from pathlib import Path
+        from auto_book.models.image import ImageAsset
+        assets_path = Path(output_dir) / "images" / "image_assets.json"
+        existing_ids = {a.anchor_id for a in chapter_assets}
+        if assets_path.exists():
+            raw = json.loads(assets_path.read_text(encoding="utf-8"))
+            for item in raw:
+                a = ImageAsset.model_validate(item)
+                if a.anchor_id not in existing_ids and a.file_path and Path(a.file_path).exists():
+                    chapter_assets.append(a)
+                    existing_ids.add(a.anchor_id)
+
+        # Save merged assets
+        from auto_book.agents.image_agent import _save_json
+        Path(output_dir, "images").mkdir(parents=True, exist_ok=True)
+        _save_json(Path(output_dir) / "images" / "image_assets.json",
+                   [a.model_dump() for a in chapter_assets])
+
+        # Cover fallback: load from disk if queue didn't produce one
+        if cover_asset is None or cover_asset.is_placeholder:
+            cover_path = Path(output_dir) / "images" / "COVER.png"
+            if cover_path.exists():
+                cover_asset = ImageAsset(
+                    anchor_id="COVER", chapter_number=0, position="cover",
+                    file_path=str(cover_path), prompt_used="", alt_text="Cover image",
+                    is_placeholder=False,
+                )
+
+    except Exception as exc:
+        logger.warning("Image collection failed; proceeding without images: %s", exc)
+        chapter_assets = []
+        cover_asset = None
+
+    logger.info(
+        "Image collection complete: %s chapter image(s), cover=%s",
+        len(chapter_assets),
+        "yes" if cover_asset and not cover_asset.is_placeholder else "no",
+    )
     return {
-        "image_assets": image_assets,
+        "image_assets": chapter_assets,
+        "cover_asset": cover_asset,
         "phase": RunPhase.ASSEMBLING,
     }
 
@@ -387,6 +529,7 @@ def export_book(state: GraphState) -> dict[str, Any]:
             accepted,
             output_dir,
             image_assets=image_assets,
+            cover_asset=state.get("cover_asset"),
         )
     except Exception as exc:
         logger.error("DOCX export failed: %s", exc)
@@ -427,12 +570,30 @@ def handle_failure(state: GraphState) -> dict[str, Any]:
 def route_after_review(state: GraphState) -> str:
     """Route after reviewer output."""
 
+    if state.get("phase") == RunPhase.RATE_LIMITED:
+        return "rate_limited"
     if state.get("phase") == RunPhase.FAILED:
         return "handle_failure"
 
     review = state.get("review_decision")
     if review is None or review.decision == ReviewDecisionEnum.PASS:
         return "update_memory"
+
+    if settings.review.single_pass and not settings.review.allow_reviewer_revisions:
+        if review.score >= settings.review.soft_accept_score:
+            get_logger().warning(
+                "Soft-accepting chapter %s after single review with score %.1f",
+                review.chapter_number,
+                review.score,
+            )
+            return "update_memory"
+        # Allow revisions; route_after_write gates whether re-review happens
+        revision_count = int(state.get("revision_count") or 0)
+        if review.decision == ReviewDecisionEnum.REVISE and revision_count < settings.retry.max_revisions:
+            return "write_chapter"
+        if review.decision == ReviewDecisionEnum.FAIL and int(state.get("regeneration_count") or 0) < settings.retry.max_regenerations:
+            return "write_chapter"
+        return "handle_failure"
 
     revision_count = int(state.get("revision_count") or 0)
     regeneration_count = int(state.get("regeneration_count") or 0)
@@ -481,6 +642,8 @@ def _infer_failure_reason(state: GraphState) -> str:
 def route_after_step(state: GraphState) -> str:
     """Route to failure if a node marked the run failed."""
 
+    if state.get("phase") == RunPhase.RATE_LIMITED:
+        return "rate_limited"
     if state.get("phase") == RunPhase.FAILED:
         return "handle_failure"
     return "next"
@@ -489,16 +652,24 @@ def route_after_step(state: GraphState) -> str:
 def route_after_prepare(state: GraphState) -> str:
     """Route after preparing a chapter."""
 
+    if state.get("phase") == RunPhase.RATE_LIMITED:
+        return "rate_limited"
     if state.get("phase") == RunPhase.FAILED:
         return "handle_failure"
     if state.get("phase") == RunPhase.ASSEMBLING:
         return "assemble_book"
+    if state.get("phase") == RunPhase.REVIEWING:
+        return "review_chapter"
+    if state.get("phase") == RunPhase.MEMORY_UPDATE:
+        return "update_memory"
     return "write_chapter"
 
 
 def route_after_assemble(state: GraphState) -> str:
     """Route after assembly."""
 
+    if state.get("phase") == RunPhase.RATE_LIMITED:
+        return "rate_limited"
     if state.get("phase") == RunPhase.FAILED:
         return "handle_failure"
     return "export_book"
@@ -511,6 +682,21 @@ def route_after_check(state: GraphState) -> str:
     total = len(bible.chapter_outline) if bible else settings.book.default_chapter_count
     current = int(state.get("current_chapter") or 0)
     return "prepare_chapter" if current < total else "assemble_book"
+
+
+def route_after_write(state: GraphState) -> str:
+    """Route after write_chapter; skip reviewer if disabled or passes exhausted."""
+
+    if state.get("phase") == RunPhase.RATE_LIMITED:
+        return "rate_limited"
+    if state.get("phase") == RunPhase.FAILED:
+        return "handle_failure"
+    if (
+        not settings.review.enabled
+        or int(state.get("review_passes") or 0) >= settings.review.max_review_passes
+    ):
+        return "update_memory"
+    return "review_chapter"
 
 
 def build_graph():
@@ -540,6 +726,7 @@ def build_graph():
         {
             "next": "plan_book",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
     graph.add_conditional_edges(
@@ -548,6 +735,7 @@ def build_graph():
         {
             "next": "prepare_chapter",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
     graph.add_conditional_edges(
@@ -555,16 +743,21 @@ def build_graph():
         route_after_prepare,
         {
             "write_chapter": "write_chapter",
+            "review_chapter": "review_chapter",
+            "update_memory": "update_memory",
             "assemble_book": "assemble_book",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
     graph.add_conditional_edges(
         "write_chapter",
-        route_after_step,
+        route_after_write,
         {
-            "next": "review_chapter",
+            "review_chapter": "review_chapter",
+            "update_memory": "update_memory",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
     graph.add_conditional_edges(
@@ -573,6 +766,7 @@ def build_graph():
         {
             "export_book": "export_book",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
 
@@ -583,6 +777,7 @@ def build_graph():
             "update_memory": "update_memory",
             "write_chapter": "write_chapter",
             "handle_failure": "handle_failure",
+            "rate_limited": END,
         },
     )
     graph.add_conditional_edges(
