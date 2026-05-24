@@ -17,10 +17,29 @@ REVIEWER_SYSTEM_PROMPT = """You are a strict but constructive book editor.
 
 Evaluate a chapter draft against the Book Bible and previous chapter summaries.
 
-Decision rules:
-- pass: score 8-10, chapter is ready.
-- revise: score 5-7, chapter has specific fixable issues.
-- fail: score 0-4, chapter misses the goal and needs full regeneration.
+SCORING CALIBRATION — follow these examples precisely:
+- Score 9-10 (pass): Excellent. Reads like a polished book chapter. Rich prose,
+  strong examples, good flow, meets word target. Very rare.
+- Score 7-8 (pass): Good. Covers the topic well, has decent prose, roughly meets
+  the word target. Minor suggestions only. THIS IS THE EXPECTED RANGE for
+  a competent draft.
+- Score 5-6 (revise): Mediocre. Has structural problems like missing key topics,
+  significantly under the word target, or reads like a bullet-point outline
+  instead of prose. Requires specific fixes.
+- Score 0-4 (fail): Terrible. Off-topic, incoherent, or so short it's unusable.
+  Needs full regeneration.
+
+DECISION RULES:
+- pass (score 7-10): Chapter is ready. Put minor polish suggestions in
+  suggested_edits and return pass. DO NOT return revise for subjective
+  improvements like "could use more examples" if the chapter already covers
+  the topic adequately.
+- revise (score 5-6): Chapter has specific, fixable structural problems.
+  You MUST list concrete required_fixes. Only request revisions for
+  OBJECTIVE issues, not stylistic preferences.
+- fail (score 0-4): Chapter misses the goal entirely. Needs full regeneration.
+
+{revision_context}
 
 Book context:
 - Title: {title}
@@ -32,6 +51,7 @@ Book context:
 Chapter goal:
 Chapter {chapter_number}: "{chapter_title}"
 Expected content: {chapter_summary}
+Word target: {word_target}
 """
 
 REVIEWER_USER_PROMPT = """Review this chapter draft:
@@ -40,8 +60,8 @@ REVIEWER_USER_PROMPT = """Review this chapter draft:
 
 {continuity_context}
 
-Return a structured ReviewDecision with specific problems and required fixes
-when the decision is revise or fail.
+Return a structured ReviewDecision. Be fair — if the chapter covers its topic
+with reasonable prose and approximately meets the word target, score it 7+.
 """
 
 
@@ -49,6 +69,7 @@ def run_reviewer(
     draft: ChapterDraft,
     book_bible: BookBible,
     dynamic_memory: DynamicMemory,
+    revision_count: int = 0,
 ) -> ReviewDecision:
     """Run the live Reviewer Agent."""
 
@@ -63,6 +84,25 @@ def run_reviewer(
     )
     chapter_title = outline.title if outline else draft.title
     chapter_summary = outline.summary if outline else "No chapter summary available."
+    word_target = outline.word_count_target if outline else settings.book.target_words_per_chapter
+
+    # Revision-aware context: relax standards after first revision
+    revision_context = ""
+    if revision_count >= 2:
+        revision_context = (
+            "IMPORTANT: This chapter has already been revised "
+            f"{revision_count} time(s). Be MORE LENIENT in your scoring. "
+            "If the chapter covers the core topic and is reasonably well-written, "
+            "score it 7+ and pass it. Do NOT ask for further revisions unless "
+            "there are critical structural problems. Minor improvements should "
+            "go in suggested_edits with a pass decision."
+        )
+    elif revision_count == 1:
+        revision_context = (
+            "NOTE: This is a revised draft (revision #1). The writer addressed "
+            "previous feedback. If the main issues were fixed, score 7+ and pass. "
+            "Only request another revision for remaining serious problems."
+        )
 
     system_msg = REVIEWER_SYSTEM_PROMPT.format(
         title=book_bible.working_title,
@@ -73,6 +113,8 @@ def run_reviewer(
         chapter_number=draft.chapter_number,
         chapter_title=chapter_title,
         chapter_summary=chapter_summary,
+        word_target=word_target,
+        revision_context=revision_context,
     )
     user_msg = REVIEWER_USER_PROMPT.format(
         chapter_body=truncate_to_budget(draft.body, settings.context_budget.total_max // 2),

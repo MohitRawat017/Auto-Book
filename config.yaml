@@ -2,12 +2,14 @@
 
 llm:
   provider: "groq"
-  writer_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
-  reviewer_model: "meta-llama/llama-4-scout-17b-16e-instruct"
-  planner_model: "meta-llama/llama-4-maverick-17b-128e-instruct"
-  memory_model: "meta-llama/llama-4-scout-17b-16e-instruct"
-  temperature_creative: 0.7
-  temperature_analytical: 0.2
+  writer_model: "llama-3.3-70b-versatile"
+  reviewer_model: "openai/gpt-oss-120b"
+  planner_model: "qwen/qwen3-32b"
+  memory_model: "openai/gpt-oss-20b"
+  temperature_writer: 0.8
+  temperature_planner: 0.7
+  temperature_reviewer: 0.2
+  temperature_memory: 0.1
 
 book:
   default_chapter_count: 10
@@ -17,10 +19,10 @@ book:
   target_total_pages: 30
 
 retry:
-  max_revisions: 2
+  max_revisions: 3
   max_regenerations: 1
   max_validation_retries: 3
-  retry_delay_seconds: 2
+  retry_delay_seconds: 6
 
 context_budget:
   system_prompt: 500

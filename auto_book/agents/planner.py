@@ -25,6 +25,13 @@ Rules:
 - Include useful forbidden topics to keep the writer on track.
 - Include a glossary for terms that need consistency.
 
+CHAPTER OUTLINE QUALITY — This is critical:
+- Each chapter MUST have 4-6 key_topics (not just 2). These guide the writer.
+- Each chapter summary should be 3-4 sentences describing: what the reader learns,
+  the teaching approach (examples, stories, exercises), and how it connects
+  to the next chapter.
+- word_count_target must be set to {words_per_chapter} for every chapter.
+
 Genre: {genre}
 """
 
@@ -32,9 +39,20 @@ PLANNER_USER_PROMPT = """Create a Book Bible for this book idea:
 
 {brief}
 
-Return a complete plan with title, subtitle, genre, thesis, target audience,
-reader pain points, book promise, tone, style guide, chapter outline, required
-themes, forbidden topics, glossary, and image direction.
+Return a complete plan with:
+- working_title and subtitle
+- genre, core_thesis, target_audience
+- reader_pain_points (at least 3 specific pain points)
+- book_promise (one compelling sentence)
+- tone and style_guide (be specific, e.g. "conversational with humor" not just "friendly")
+- chapter_outline with {chapter_count} chapters, each having:
+  - 4-6 key_topics
+  - 3-4 sentence summary describing content and teaching approach
+  - word_count_target set to {words_per_chapter}
+- required_themes
+- forbidden_topics
+- glossary
+- image_direction
 """
 
 
@@ -48,7 +66,11 @@ def run_planner(user_brief: str, genre: str) -> BookBible:
         total_pages=settings.book.target_total_pages,
         genre=genre,
     )
-    user_msg = PLANNER_USER_PROMPT.format(brief=user_brief)
+    user_msg = PLANNER_USER_PROMPT.format(
+        brief=user_brief,
+        chapter_count=settings.book.default_chapter_count,
+        words_per_chapter=settings.book.target_words_per_chapter,
+    )
     logger.info("Planner prompt estimate: %s tokens", count_tokens(system_msg + user_msg))
 
     llm = get_llm("planner")

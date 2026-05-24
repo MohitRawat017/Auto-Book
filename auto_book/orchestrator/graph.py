@@ -182,12 +182,17 @@ def write_chapter(state: GraphState) -> dict[str, Any]:
     elif review and review.decision == ReviewDecisionEnum.FAIL:
         regeneration_count += 1
 
+    # Pass the previous draft so the writer can revise instead of rewriting blind
+    previous_draft = state.get("chapter_draft") if revision_feedback else None
+
     try:
         draft = run_writer(
             chapter_plan=chapter_plan,
             book_bible=bible,
             dynamic_memory=state.get("dynamic_memory", DynamicMemory()),
             revision_feedback=revision_feedback,
+            previous_draft=previous_draft,
+            revision_number=revision_count,
         )
     except Exception as exc:
         logger.error("Writing failed for chapter %s: %s", chapter_plan.chapter_number, exc)
@@ -226,12 +231,19 @@ def review_chapter(state: GraphState) -> dict[str, Any]:
             "error": "Cannot review chapter without Book Bible and ChapterDraft.",
         }
 
+    revision_count = int(state.get("revision_count") or 0)
+
     try:
-        review = run_reviewer(draft, bible, state.get("dynamic_memory", DynamicMemory()))
+        review = run_reviewer(
+            draft, bible,
+            state.get("dynamic_memory", DynamicMemory()),
+            revision_count=revision_count,
+        )
     except Exception as exc:
         logger.error("Review failed for chapter %s: %s", draft.chapter_number, exc)
         return {"phase": RunPhase.FAILED, "error": str(exc)}
 
+    save_review(review, state.get("output_directory", settings.output.directory))
     statuses = _update_chapter_status(
         state.get("chapter_statuses", []),
         draft.chapter_number,
@@ -341,7 +353,7 @@ def export_book(state: GraphState) -> dict[str, Any]:
 def handle_failure(state: GraphState) -> dict[str, Any]:
     """Handle unrecoverable failures."""
 
-    error = state.get("error") or "Unknown error"
+    error = state.get("error") or _infer_failure_reason(state)
     get_logger().error("Run failed: %s", error)
     return {"phase": RunPhase.FAILED, "error": error}
 
@@ -362,6 +374,13 @@ def route_after_review(state: GraphState) -> str:
     if review.decision == ReviewDecisionEnum.REVISE:
         if revision_count < settings.retry.max_revisions:
             return "write_chapter"
+        if review.score >= 6:
+            get_logger().warning(
+                "Accepting chapter %s after max revisions with review score %.1f",
+                review.chapter_number,
+                review.score,
+            )
+            return "update_memory"
         return "handle_failure"
 
     if review.decision == ReviewDecisionEnum.FAIL:
@@ -370,6 +389,27 @@ def route_after_review(state: GraphState) -> str:
         return "handle_failure"
 
     return "handle_failure"
+
+
+def _infer_failure_reason(state: GraphState) -> str:
+    """Create a useful failure reason when routing failed without an exception."""
+
+    review = state.get("review_decision")
+    if review is not None:
+        if review.decision == ReviewDecisionEnum.REVISE:
+            return (
+                f"Chapter {review.chapter_number} still required revision after "
+                f"{state.get('revision_count', 0)} revision attempt(s). "
+                f"Last review score: {review.score}. Required fixes: "
+                f"{'; '.join(review.required_fixes) or 'none provided'}"
+            )
+        if review.decision == ReviewDecisionEnum.FAIL:
+            return (
+                f"Chapter {review.chapter_number} failed review after "
+                f"{state.get('regeneration_count', 0)} regeneration attempt(s). "
+                f"Problems: {'; '.join(review.problems) or 'none provided'}"
+            )
+    return "Run failed without an explicit error."
 
 
 def route_after_step(state: GraphState) -> str:

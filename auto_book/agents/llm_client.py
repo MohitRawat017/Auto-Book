@@ -15,10 +15,10 @@ def get_llm(role: str) -> ChatGroq:
         "memory": settings.llm.memory_model,
     }
     temperature_map = {
-        "writer": settings.llm.temperature_creative,
-        "planner": settings.llm.temperature_creative,
-        "reviewer": settings.llm.temperature_analytical,
-        "memory": settings.llm.temperature_analytical,
+        "writer": settings.llm.temperature_writer,
+        "planner": settings.llm.temperature_planner,
+        "reviewer": settings.llm.temperature_reviewer,
+        "memory": settings.llm.temperature_memory,
     }
 
     return ChatGroq(

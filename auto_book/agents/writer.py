@@ -21,16 +21,20 @@ Book context:
 - Tone: {tone}
 - Style guide: {style_guide}
 
-Rules:
-- Write only the requested chapter.
-- Return a ChapterDraft object.
-- Put the full chapter text in the body field as clean Markdown.
-- Start body with a single # chapter heading.
-- Use ## section headings where useful.
-- Target approximately {word_target} words.
-- Maintain continuity with previous chapters.
-- Avoid repeating points already covered.
-- Follow the tone and style guide strictly.
+CRITICAL RULES:
+1. Write ONLY the requested chapter. Return a ChapterDraft object.
+2. Put the FULL chapter text in the "body" field as clean Markdown.
+3. Start body with a single # chapter heading, use ## for sections.
+4. You MUST write AT LEAST {word_target} words. This is NON-NEGOTIABLE.
+   Count your paragraphs: each paragraph is ~80-100 words, so {word_target} words
+   means at least {paragraph_estimate} substantial paragraphs of flowing prose.
+5. Write in FLOWING PROSE — full paragraphs with rich detail, anecdotes, and
+   examples. DO NOT write bullet-point lists or skeletal outlines. Each
+   paragraph should be 3-5 sentences minimum.
+6. Use storytelling: open sections with a relatable scenario or question,
+   explain concepts through examples, and close with actionable takeaways.
+7. Maintain continuity with previous chapters — don't repeat covered material.
+8. Match the tone and style guide strictly.
 {forbidden}
 """
 
@@ -39,15 +43,32 @@ WRITER_USER_PROMPT = """Write Chapter {chapter_number}: "{title}".
 Chapter goal:
 {summary}
 
-Key topics:
+Key topics to cover:
 {topics}
 
 {continuity_section}
 
 {revision_section}
 
-Write the complete chapter now.
+{previous_draft_section}
+
+Write the COMPLETE chapter now. Remember: minimum {word_target} words of flowing prose.
 """
+
+REVISION_PREAMBLE = """REVISION INSTRUCTIONS — This is attempt #{revision_number}.
+The reviewer identified these specific issues that MUST be fixed:
+{feedback}
+
+Your previous draft is shown below. DO NOT start from scratch — instead, REVISE
+and EXPAND the existing draft to address each issue above. Keep what works,
+fix what doesn't, and add the missing content.
+
+PREVIOUS DRAFT TO REVISE:
+---
+{previous_body}
+---
+
+Now write the REVISED chapter incorporating all fixes:"""
 
 
 def run_writer(
@@ -55,13 +76,17 @@ def run_writer(
     book_bible: BookBible,
     dynamic_memory: DynamicMemory,
     revision_feedback: list[str] | None = None,
+    previous_draft: ChapterDraft | None = None,
+    revision_number: int = 0,
 ) -> ChapterDraft:
     """Run the live Writer Agent for one chapter."""
 
     logger = get_logger()
     forbidden = _build_forbidden_section(book_bible)
     continuity = _build_continuity_notes(dynamic_memory)
-    revision_section = _build_revision_section(revision_feedback)
+
+    word_target = chapter_plan.word_count_target
+    paragraph_estimate = max(5, word_target // 90)
 
     system_msg = WRITER_SYSTEM_PROMPT.format(
         genre=book_bible.genre,
@@ -70,9 +95,26 @@ def run_writer(
         audience=book_bible.target_audience,
         tone=book_bible.tone,
         style_guide=book_bible.style_guide,
-        word_target=chapter_plan.word_count_target,
+        word_target=word_target,
+        paragraph_estimate=paragraph_estimate,
         forbidden=forbidden,
     )
+
+    # Build revision section — now includes the PREVIOUS DRAFT
+    revision_section = ""
+    previous_draft_section = ""
+    if revision_feedback and previous_draft:
+        revision_section = REVISION_PREAMBLE.format(
+            revision_number=revision_number,
+            feedback="\n".join(f"- {item}" for item in revision_feedback),
+            previous_body=truncate_to_budget(
+                previous_draft.body,
+                settings.context_budget.total_max // 3,
+            ),
+        )
+    elif revision_feedback:
+        revision_section = _build_revision_section(revision_feedback)
+
     user_msg = WRITER_USER_PROMPT.format(
         chapter_number=chapter_plan.chapter_number,
         title=chapter_plan.title,
@@ -80,6 +122,8 @@ def run_writer(
         topics="\n".join(f"- {topic}" for topic in chapter_plan.key_topics),
         continuity_section=continuity,
         revision_section=revision_section,
+        previous_draft_section=previous_draft_section,
+        word_target=word_target,
     )
 
     prompt_tokens = count_tokens(system_msg + user_msg)
@@ -100,6 +144,8 @@ def run_writer(
             topics="\n".join(f"- {topic}" for topic in chapter_plan.key_topics),
             continuity_section=continuity,
             revision_section=revision_section,
+            previous_draft_section=previous_draft_section,
+            word_target=word_target,
         )
 
     logger.info(

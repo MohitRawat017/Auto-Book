@@ -26,12 +26,14 @@ class Secrets(BaseSettings):
 
 class LLMSettings(BaseModel):
     provider: str = "groq"
-    writer_model: str = "meta-llama/llama-4-maverick-17b-128e-instruct"
-    reviewer_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    planner_model: str = "meta-llama/llama-4-maverick-17b-128e-instruct"
-    memory_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    temperature_creative: float = 0.7
-    temperature_analytical: float = 0.2
+    writer_model: str = "llama-3.3-70b-versatile"
+    reviewer_model: str = "openai/gpt-oss-120b"
+    planner_model: str = "qwen/qwen3-32b"
+    memory_model: str = "openai/gpt-oss-20b"
+    temperature_writer: float = 0.8
+    temperature_planner: float = 0.7
+    temperature_reviewer: float = 0.2
+    temperature_memory: float = 0.1
 
 
 class BookSettings(BaseModel):
