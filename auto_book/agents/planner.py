@@ -63,7 +63,17 @@ Return a complete plan with:
 def run_planner(user_brief: str, genre: str) -> BookBible:
     """Run the live Planner Agent."""
 
+    from auto_book.utils.trends import fetch_trending_keywords
+
     logger = get_logger()
+    trending = fetch_trending_keywords(user_brief)
+    trends_section = ""
+    if trending:
+        trends_section = (
+            "\nTrending search keywords related to this topic (from Google Trends):\n"
+            + "\n".join(f"- {kw}" for kw in trending)
+            + "\nIncorporate these naturally into chapter topics and key_topics where relevant.\n"
+        )
     system_msg = PLANNER_SYSTEM_PROMPT.format(
         chapter_count=settings.book.default_chapter_count,
         words_per_chapter=settings.book.target_words_per_chapter,
@@ -74,7 +84,7 @@ def run_planner(user_brief: str, genre: str) -> BookBible:
         brief=user_brief,
         chapter_count=settings.book.default_chapter_count,
         words_per_chapter=settings.book.target_words_per_chapter,
-    )
+    ) + trends_section
     logger.info("Planner prompt estimate: %s tokens", count_tokens(system_msg + user_msg))
 
     llm = get_llm("planner")
