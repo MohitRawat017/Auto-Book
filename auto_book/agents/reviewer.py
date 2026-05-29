@@ -227,12 +227,12 @@ def _build_review_continuity(memory: DynamicMemory) -> str:
 
 
 def _build_review_policy() -> str:
-    if not settings.review.single_pass or settings.review.allow_reviewer_revisions:
+    if settings.review.max_review_passes > 1:
         return ""
 
     return (
-        "BUDGET-CONSCIOUS SINGLE-PASS REVIEW MODE:\n"
-        f"- The reviewer should only run once per chapter.\n"
+        "BUDGET-CONSCIOUS REVIEW MODE:\n"
+        f"- The reviewer runs at most once per chapter.\n"
         f"- Treat {settings.review.accept_score:.1f}+ as a clean pass.\n"
         f"- Also return pass for any usable chapter scoring {settings.review.soft_accept_score:.1f} or higher.\n"
         "- Put non-critical improvements in suggested_edits instead of requesting revision.\n"
