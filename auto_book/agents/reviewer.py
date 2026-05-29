@@ -11,6 +11,7 @@ from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft
 from auto_book.models.memory import DynamicMemory
 from auto_book.models.review import ReviewDecision
+from auto_book.utils.llm import extract_message_text, load_json_object, strip_code_fence
 from auto_book.utils.logger import get_logger
 from auto_book.utils.rate_limiter import (
     raise_if_rate_limited,
@@ -176,7 +177,7 @@ def run_reviewer(
             )
             record_success()
             result = _parse_review_decision(
-                _extract_message_text(response),
+                extract_message_text(response),
                 draft.chapter_number,
             )
 
@@ -240,27 +241,8 @@ def _build_review_policy() -> str:
     )
 
 
-def _extract_message_text(response: object) -> str:
-    """Extract text from a LangChain chat response."""
-
-    content = getattr(response, "content", response)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    return str(content)
-
-
 def _parse_review_decision(raw_text: str, chapter_number: int) -> ReviewDecision:
-    payload = _load_json_object(_strip_code_fence(raw_text))
+    payload = load_json_object(strip_code_fence(raw_text))
     if isinstance(payload.get("arguments"), dict):
         payload = payload["arguments"]
 
@@ -270,33 +252,6 @@ def _parse_review_decision(raw_text: str, chapter_number: int) -> ReviewDecision
     payload["tone_match"] = bool(payload.get("tone_match", True))
 
     return ReviewDecision.model_validate(payload)
-
-
-def _strip_code_fence(text: str) -> str:
-    body = text.strip()
-    if body.startswith("```"):
-        lines = body.splitlines()
-        if lines and lines[0].strip().startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        body = "\n".join(lines).strip()
-    return body
-
-
-def _load_json_object(text: str) -> dict[str, Any]:
-    try:
-        data = json.loads(text)
-    except JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        data = json.loads(text[start : end + 1])
-
-    if not isinstance(data, dict):
-        raise ValueError("Reviewer returned JSON, but not an object.")
-    return data
 
 
 def _coerce_string_list(value: object) -> list[str]:

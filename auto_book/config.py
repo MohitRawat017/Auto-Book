@@ -54,10 +54,8 @@ class RetrySettings(BaseModel):
 class ReviewSettings(BaseModel):
     enabled: bool = True
     max_review_passes: int = 1
-    single_pass: bool = True
     accept_score: float = 7.0
     soft_accept_score: float = 6.0
-    allow_reviewer_revisions: bool = False
 
 
 class ContextBudget(BaseModel):

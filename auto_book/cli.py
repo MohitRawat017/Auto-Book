@@ -22,8 +22,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="config.yaml",
-        help="Path to config.yaml.",
+        default="configs/full.yaml",
+        help="Path to config file.",
     )
     parser.add_argument(
         "--output",

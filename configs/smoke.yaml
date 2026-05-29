@@ -1,0 +1,54 @@
+# Smoke test — 3 chapters, ~500 words each, ~12k tokens
+
+llm:
+  provider: "groq"
+  writer_model: "llama-3.3-70b-versatile"
+  reviewer_model: "openai/gpt-oss-120b"
+  planner_model: "qwen/qwen3-32b"
+  memory_model: "openai/gpt-oss-20b"
+  temperature_writer: 0.8
+  temperature_planner: 0.7
+  temperature_reviewer: 0.2
+  temperature_memory: 0.1
+
+book:
+  default_chapter_count: 3
+  target_words_per_chapter: 500
+  min_words_per_chapter: 250
+  max_words_per_chapter: 600
+  target_total_pages: 6
+
+retry:
+  max_revisions: 3
+  max_regenerations: 1
+  max_validation_retries: 3
+  retry_delay_seconds: 6
+
+review:
+  enabled: true
+  max_review_passes: 1
+  accept_score: 6.0
+  soft_accept_score: 5.0
+
+context_budget:
+  system_prompt: 500
+  book_bible: 1200
+  dynamic_memory: 1200
+  research_notes: 0
+  chapter_plan: 500
+  generation_headroom: 2000
+  total_max: 6000
+
+output:
+  directory: "./output/smoke"
+  save_intermediate: true
+
+images:
+  enabled: true
+  generate_actual: false
+  max_images_per_chapter: 2
+
+logging:
+  level: "INFO"
+  log_to_file: true
+  log_file: "./output/smoke/run.log"

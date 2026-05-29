@@ -8,6 +8,7 @@ from auto_book.config import settings
 from auto_book.models.book_bible import BookBible
 from auto_book.models.chapter import ChapterDraft, ChapterPlan
 from auto_book.models.memory import DynamicMemory
+from auto_book.utils.llm import extract_message_text
 from auto_book.utils.logger import get_logger
 from auto_book.utils.rate_limiter import (
     raise_if_rate_limited,
@@ -179,7 +180,7 @@ def run_writer(
             )
             record_success()
             body = _normalize_markdown_response(
-                _extract_message_text(response),
+                extract_message_text(response),
                 chapter_plan.title,
             )
             body = _normalize_image_anchors(body)
@@ -289,25 +290,6 @@ Image anchor rules:
 - On revisions, preserve existing useful anchors unless they are clearly in the
   wrong place.
 """
-
-
-def _extract_message_text(response: object) -> str:
-    """Extract text from a LangChain chat response."""
-
-    content = getattr(response, "content", response)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text") or item.get("content")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(parts)
-    return str(content)
 
 
 def _normalize_markdown_response(markdown: str, chapter_title: str) -> str:

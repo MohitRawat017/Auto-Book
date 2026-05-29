@@ -1,13 +1,15 @@
 """LangGraph state machine for the Phase 2 core writing loop."""
 
+import json
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from langgraph.graph import END, StateGraph
 
 from auto_book.agents.assembler import assemble_docx, assemble_markdown
-from auto_book.agents.image_agent import run_image_agent
+from auto_book.agents.image_agent import run_image_agent, _save_json
 from auto_book.agents.memory_updater import run_memory_update
 from auto_book.agents.planner import run_planner
 from auto_book.agents.reviewer import run_reviewer
@@ -15,6 +17,7 @@ from auto_book.agents.writer import run_writer
 from auto_book.config import settings
 from auto_book.models.chapter import ChapterPlan
 from auto_book.models.export import ExportResult
+from auto_book.models.image import ImageAsset
 from auto_book.models.memory import DynamicMemory
 from auto_book.models.review import ReviewDecisionEnum
 from auto_book.models.run_state import ChapterStatus, RunPhase
@@ -441,9 +444,6 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
         chapter_assets, cover_asset = image_queue.collect(timeout=600)
 
         # Merge with any already-existing assets saved to disk (resume safety)
-        import json
-        from pathlib import Path
-        from auto_book.models.image import ImageAsset
         assets_path = Path(output_dir) / "images" / "image_assets.json"
         existing_ids = {a.anchor_id for a in chapter_assets}
         if assets_path.exists():
@@ -455,7 +455,6 @@ def assemble_book(state: GraphState) -> dict[str, Any]:
                     existing_ids.add(a.anchor_id)
 
         # Save merged assets
-        from auto_book.agents.image_agent import _save_json
         Path(output_dir, "images").mkdir(parents=True, exist_ok=True)
         _save_json(Path(output_dir) / "images" / "image_assets.json",
                    [a.model_dump() for a in chapter_assets])
@@ -579,21 +578,13 @@ def route_after_review(state: GraphState) -> str:
     if review is None or review.decision == ReviewDecisionEnum.PASS:
         return "update_memory"
 
-    if settings.review.single_pass and not settings.review.allow_reviewer_revisions:
-        if review.score >= settings.review.soft_accept_score:
-            get_logger().warning(
-                "Soft-accepting chapter %s after single review with score %.1f",
-                review.chapter_number,
-                review.score,
-            )
-            return "update_memory"
-        # Allow revisions; route_after_write gates whether re-review happens
-        revision_count = int(state.get("revision_count") or 0)
-        if review.decision == ReviewDecisionEnum.REVISE and revision_count < settings.retry.max_revisions:
-            return "write_chapter"
-        if review.decision == ReviewDecisionEnum.FAIL and int(state.get("regeneration_count") or 0) < settings.retry.max_regenerations:
-            return "write_chapter"
-        return "handle_failure"
+    if review.score >= settings.review.soft_accept_score:
+        get_logger().warning(
+            "Soft-accepting chapter %s with score %.1f",
+            review.chapter_number,
+            review.score,
+        )
+        return "update_memory"
 
     revision_count = int(state.get("revision_count") or 0)
     regeneration_count = int(state.get("regeneration_count") or 0)
@@ -601,14 +592,7 @@ def route_after_review(state: GraphState) -> str:
     if review.decision == ReviewDecisionEnum.REVISE:
         if revision_count < settings.retry.max_revisions:
             return "write_chapter"
-        if review.score >= 6:
-            get_logger().warning(
-                "Accepting chapter %s after max revisions with review score %.1f",
-                review.chapter_number,
-                review.score,
-            )
-            return "update_memory"
-        return "handle_failure"
+        return "update_memory"  # accept after max revisions
 
     if review.decision == ReviewDecisionEnum.FAIL:
         if regeneration_count < settings.retry.max_regenerations:

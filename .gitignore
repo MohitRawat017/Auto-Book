@@ -1,4 +1,4 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
@@ -7,11 +7,16 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+.venv/
+
+# Secrets
+.env
+
+# Generated outputs
+output/
+
+# Internal planning docs
 PLAN/
 
-# Local configuration and generated outputs
-.env
-output/
-_diag.py
-graphify.py
+# Word temp files
+~$*.docx

@@ -118,20 +118,6 @@ def assemble_docx(
         except Exception as exc:
             get_logger().warning("Template load failed (%s); using blank document.", exc)
 
-    _build_docx(doc, book_bible, ordered, images, has_template, cover_asset)
-    doc.save(str(output_path))
-    logger.info("DOCX assembled at %s", output_path)
-    return str(output_path)
-
-
-def _build_docx(
-    doc: Document,
-    book_bible: BookBible,
-    ordered: list[ChapterDraft],
-    images: list[ImageAsset],
-    has_template: bool,
-    cover_asset: ImageAsset | None = None,
-) -> None:
     _add_title_page(doc, book_bible, has_template, cover_asset)
     doc.add_page_break()
     _add_toc(doc, chapters=ordered, has_template=has_template)
@@ -139,6 +125,10 @@ def _build_docx(
     for chapter in ordered:
         doc.add_page_break()
         _add_chapter(doc, chapter, images, has_template)
+
+    doc.save(str(output_path))
+    logger.info("DOCX assembled at %s", output_path)
+    return str(output_path)
 
 
 def _add_title_page(
